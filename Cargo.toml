@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 bootloader = "0.9.35"
+spin = "0.12.3"
 
 [profile.dev]
 panic = "abort"

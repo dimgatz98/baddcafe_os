@@ -550,6 +550,256 @@ image and hands it to QEMU.
 
 ---
 
+## Step 5 — The screen is memory
+
+**Goal.** Make the kernel say something on its own. Until now every observation came
+from outside the machine: `readelf`, `objdump`, the QEMU monitor. The kernel itself had
+never produced a single byte of output.
+
+**Concept — memory-mapped I/O.** In a normal program, printing means calling a library,
+which calls the operating system, which talks to a driver. None of that exists here.
+What does exist is far more direct: **the graphics hardware watches a region of memory**.
+Whatever is written there appears on screen. No call, no device, no protocol — one
+`mov` to an address.
+
+That address is `0xb8000`. From it stretches a grid of **25 rows by 80 columns**, two
+bytes per cell:
+
+| Byte | Meaning |
+|---|---|
+| first | The character, in **code page 437** (the IBM PC character set). For letters and digits it coincides with ASCII. |
+| second | The colour attribute. Bits 0-3 foreground, bits 4-6 background, bit 7 blink. `0x0f` is white on black. |
+
+Cells are consecutive: cell 0 is the top-left corner at `0xb8000`, cell 1 at `0xb8002`,
+and row 1 begins at cell 80.
+
+**What we did.** Created `src/vga_buffer.rs` and rewrote `_start` to use it.
+
+The module defines four types, and each `#[repr(...)]` attribute is load-bearing:
+
+```rust
+#[repr(u8)]
+pub enum Color { Black = 0, Blue = 1, /* ... */ White = 15 }
+
+#[repr(transparent)]
+pub struct ColorCode(u8);
+
+#[repr(C)]
+struct ScreenChar {
+    ascii_character: u8,
+    color_code: ColorCode,
+}
+```
+
+- `#[repr(u8)]` pins each enum variant to a single byte with the numeric value we wrote.
+  Without it, the compiler is free to choose any layout it likes.
+- `#[repr(transparent)]` guarantees `ColorCode` is laid out *exactly* like the `u8`
+  inside it — no wrapper overhead. The type exists for us, not for the machine.
+- `#[repr(C)]` is the important one. Rust normally reserves the right to reorder struct
+  fields for better packing. The hardware does not negotiate: character byte first,
+  attribute byte second. `repr(C)` means "lay this out the way C would", which is to say
+  in declaration order.
+
+The buffer itself is reached through a raw pointer constant:
+
+```rust
+const BUFFER_ADDR: *mut ScreenChar = 0xb8000 as *mut ScreenChar;
+```
+
+**Why `unsafe` is unavoidable here.** Rust guarantees that safe code cannot cause
+undefined behaviour, and it proves this with the ownership and borrowing rules. Handing
+it the integer `0xb8000` and calling it an address defeats that machinery completely:
+the compiler has no way to know whether that memory exists, whether it is ours, or
+whether something else is writing it concurrently. It cannot prove anything.
+
+`unsafe` does **not** switch the checks off — that is the common misreading. It unlocks
+a small set of operations the compiler cannot verify (dereferencing raw pointers among
+them) and moves the burden of proof onto us. It is a signature, not a switch. Our
+invariant here: the VGA text buffer is mapped at this physical address by the firmware,
+the bootloader identity-maps it, and nothing else in this kernel touches those cells.
+
+**Why `volatile`.** Every write goes through `core::ptr::write_volatile`, not a plain
+store. The reason is that our program writes to those cells and never reads them back.
+An optimising compiler sees stores whose results are never observed, concludes they have
+no effect, and deletes them. It is entirely right, given what it knows: it cannot see
+that a graphics chip is reading that memory. `volatile` means "this access has an effect
+you cannot see — perform it exactly as written, do not remove it, do not reorder it".
+
+Note that we used `core::ptr::write_volatile` rather than adding phil-opp's `volatile`
+crate. A raw pointer plus the two `ptr` functions covers this case completely, and every
+crate in a kernel is code trusted with ring 0.
+
+**The `Writer`.** A small struct holding a column position and the current colour. It
+always writes to the **bottom** row, and `new_line()` copies every row up by one and
+clears the last. That way the writer never has to track which row it is on, and
+scrolling falls out for free. `write_string` filters bytes: anything outside printable
+ASCII becomes `0xfe`, a solid block — because a `&str` in Rust is UTF-8 and may contain
+bytes this hardware has no glyph for.
+
+Finally:
+
+```rust
+impl fmt::Write for Writer {
+    fn write_str(&mut self, s: &str) -> fmt::Result { ... }
+}
+```
+
+`core::fmt::Write` is a trait: a contract saying "this type can accept string slices".
+Implementing that one method is enough for the entire formatting machinery — `write!`
+and every `{}` placeholder — to start working on our type. This is the first place in
+the project where a **trait** buys us something real: `core` already contains all the
+formatting code, and it is written against the trait rather than against any concrete
+type, so it works on hardware `core` has never heard of.
+
+**What happened.** `cargo build` clean, then a screenshot taken from inside the emulator:
+
+```bash
+{ timeout 5 tail -f /dev/null; echo "screendump screen.ppm"; echo "quit"; } \
+  | qemu-system-x86_64 -drive format=raw,file=<img> -display none -monitor stdio
+```
+
+The image showed, in the bottom two rows, `BaddCafe OS` in light grey and
+`VGA text buffer at 0xb8000, 2 bytes per cell` in green. Both `write_string` and
+`write!` formatting worked on the first attempt.
+
+**Rust concepts touched.**
+- **Raw pointers** (`*mut T`) — pointers with no guarantees, the equivalent of C's
+  `unsigned char *`. Creating one is safe; dereferencing one is not.
+- **`unsafe`** — unlocks specific unverifiable operations and transfers the proof
+  obligation to the programmer.
+- **`#[repr(...)]`** — the bridge between Rust's freedom to lay out types however it
+  likes and hardware that demands an exact layout.
+- **Traits** — `core::fmt::Write` as the seam that lets `core`'s formatting code drive
+  a type written years later for a machine with no operating system.
+- **Volatile access** — telling the optimiser that a memory access has effects it cannot
+  observe.
+
+---
+
+## Step 6 — `println!` of our own
+
+**Goal.** Print from anywhere in the kernel, without threading a `Writer` through every
+function that wants to say something.
+
+**Concept — the problem with a global.** `println!` works in normal Rust because there
+is one standard output that any code can reach. We want the same: a single global
+`Writer`. But a mutable global is exactly what Rust refuses to allow casually, and for
+good reason — if two pieces of code write to it at once, the state is garbage. In a
+kernel this is not hypothetical: once hardware interrupts are enabled, an interrupt can
+fire *in the middle* of a `println!` and try to print from the handler.
+
+The type that expresses "shared, mutable, but only by one at a time" is a **mutex**. The
+usual mutex asks the operating system to put a waiting thread to sleep; there is no
+operating system here and no threads to sleep. So we use a **spinlock**: a lock that,
+when contended, simply loops until the lock is free. Wasteful in general, correct and
+minimal here.
+
+**What we did.**
+
+```toml
+spin = "0.12.3"
+```
+
+```rust
+pub static WRITER: Mutex<Writer> =
+    Mutex::new(Writer::new(ColorCode::new(Color::LightGray, Color::Black)));
+```
+
+A dependency in a kernel deserves justification, and this one has it: `spin` is
+maintained by rust-osdev, the same group behind the `bootloader` crate, and a correct
+spinlock is smaller than it looks but has real soundness subtleties (`Sync` impls,
+atomic orderings) that we are not ready to reason about yet. Writing our own is a good
+exercise for later, once atomics have been met properly.
+
+Note that `Mutex::new(...)` appears directly in a `static`. That works because
+`Writer::new` and `ColorCode::new` are **`const fn`** — functions the compiler can
+evaluate at compile time. This is why the `Writer` holds no pointer field: the buffer
+address is a module-level constant instead, so nothing in the struct needs a raw pointer
+dereference to construct. phil-opp reaches for the `lazy_static` crate at this point; we
+avoided it by making the type const-constructible, and saved a dependency.
+
+Then the macros:
+
+```rust
+#[macro_export]
+macro_rules! print {
+    ($($arg:tt)*) => ($crate::vga_buffer::_print(format_args!($($arg)*)));
+}
+
+#[macro_export]
+macro_rules! println {
+    () => ($crate::print!("\n"));
+    ($($arg:tt)*) => ($crate::print!("{}\n", format_args!($($arg)*)));
+}
+
+pub fn _print(args: fmt::Arguments) {
+    WRITER.lock().write_fmt(args).unwrap();
+}
+```
+
+`macro_rules!` is Rust's pattern-matching macro system: `$($arg:tt)*` captures any
+sequence of token trees and passes it through untouched. `format_args!` is the built-in
+that turns `"{} + {}", 2, 2` into a `fmt::Arguments` value — a description of the work,
+carrying references to the arguments, with **no allocation anywhere**. That matters: we
+have no heap. `#[macro_export]` puts the macro at the crate root, which is why
+`println!` is usable in `main.rs` with no import.
+
+We also gave the panic handler a voice:
+
+```rust
+#[panic_handler]
+fn panic(info: &PanicInfo) -> ! {
+    WRITER.lock().set_color(ColorCode::new(Color::White, Color::Red));
+    println!("{}", info);
+    loop {}
+}
+```
+
+**What happened.** Two screenshots, both taken with `screendump` from the monitor.
+
+Normal boot, bottom of the screen:
+
+```
+BaddCafe OS
+
+Booted by bootloader 0.9.35, long mode, paging on.
+Screen is memory: 2000 cells of 2 bytes at 0xb8000.
+println! works, and it formats: 2 + 2 = 4          <- green
+```
+
+Then, with a temporary `panic!("temporary panic test, index {} out of range", 42)`
+inserted at the end of `_start` and removed afterwards:
+
+```
+panicked at src/main.rs:23:5:                       <- white on red
+temporary panic test, index 42 out of range
+```
+
+Both the formatting machinery and the failure path work. Untested error handling in a
+kernel is a lie, so the panic path was exercised deliberately rather than assumed.
+
+**A known deadlock, recorded rather than fixed.** `_print` is
+`WRITER.lock().write_fmt(args).unwrap()`. The temporary lock guard lives until the end
+of that statement, so if `unwrap()` ever panicked, the panic handler would try to lock a
+mutex that is still held — and spin forever. Today it cannot happen, because our
+`write_str` always returns `Ok`. The same shape becomes a genuine hazard once interrupt
+handlers can print, and the fix then is to disable interrupts around the lock. Noted
+now so it is not discovered the hard way later.
+
+**Rust concepts touched.**
+- **`static` and interior mutability** — why a mutable global is refused, and what a
+  mutex actually provides.
+- **`const fn`** — functions evaluable at compile time, which is what allows a `static`
+  to be initialised without lazy initialisation tricks.
+- **Declarative macros** (`macro_rules!`) — token-tree capture, multiple match arms,
+  and `$crate` for hygiene.
+- **`format_args!`** — formatting without allocation, which is the only kind available
+  to us.
+- **RAII lock guards** — the lock is released when the guard is dropped, and *when*
+  that happens is a decision with consequences.
+
+---
+
 ## Reference — files, commands, and how to read the machine
 
 This section is not a journal entry. It is the lookup table: every configuration file
@@ -590,6 +840,7 @@ edition = "2024"
 
 [dependencies]
 bootloader = "0.9.35"
+spin = "0.12.3"
 
 [profile.dev]
 panic = "abort"
@@ -608,6 +859,8 @@ panic = "abort"
 - `bootloader = "0.9.35"` — a dependency our source never `use`s. It is here so that
   `bootimage`, an external tool, can read the manifest and learn which bootloader
   version to build. Cargo warns `unused dependency`; the warning is wrong for our case.
+- `spin = "0.12.3"` — a spinlock. There is no operating system to put a waiting thread
+  to sleep, so a contended lock loops instead. Used for the global `WRITER`.
 
 #### `.cargo/config.toml` — how cargo behaves in this directory
 
@@ -656,6 +909,14 @@ target is just a description it reads, not a separate build of the compiler.
 | `"rustc-abi": "softfloat"` | Turning off SSE changes how floats are *passed to functions* — the normal x86-64 ABI passes them in `xmm` registers, which we just disabled. Modern rustc refuses to let the feature and the ABI disagree silently, so the target must say so explicitly. |
 
 ### R2. Commands
+
+#### Source layout
+
+```
+src/main.rs        `_start`, the panic handler, and `mod vga_buffer;`
+src/vga_buffer.rs  the VGA text buffer: Color, ColorCode, ScreenChar, Writer,
+                   the global WRITER, and the print!/println! macros
+```
 
 #### Toolchain sanity
 
@@ -748,7 +1009,16 @@ to the terminal, and it can be driven from a script:
 The `timeout 4 tail -f /dev/null` is a four-second pause that produces no output: it
 gives the machine time to boot before the monitor command is sent. Useful monitor
 commands: `info registers`, `info mem` (page mappings), `info tlb`, `xp /16xb <addr>`
-(examine physical memory), `quit`.
+(examine physical memory), `screendump <file>.ppm`, `quit`.
+
+**Screenshotting a headless run.** `screendump` writes the current framebuffer as a
+PPM image, which is how the kernel's output can be checked without a window:
+
+```bash
+{ timeout 5 tail -f /dev/null; echo "screendump screen.ppm"; echo "quit"; } \
+  | qemu-system-x86_64 -drive format=raw,file=<img> -display none -monitor stdio
+convert screen.ppm screen.png     # ImageMagick, for a viewable file
+```
 
 This is currently our **only** way to see inside the kernel. Until we can write to the
 screen, the kernel cannot tell us anything itself.
@@ -844,50 +1114,52 @@ evidence that all three rungs were climbed before control reached `_start`.
 
 ## Current state
 
-- Branch `master`. Steps 0-3 are committed as `75d458e` ("Freestanding no_std kernel on
-  a custom bare-metal target"). Step 4 is not committed yet.
-  (An earlier version of this section claimed the repo had zero commits; that was true
-  when it was written and is no longer.)
+- Branch `master`. Committed: `75d458e` (steps 0-3), `d40df33` (step 4). Steps 5 and 6
+  are not committed yet.
 - Toolchain: nightly `1.100.0-nightly (a69a63265 2026-09-03)`, pinned by
   `rust-toolchain.toml`, with `rust-src` and `llvm-tools-preview`.
 - Edition 2024. `panic = "abort"` on both profiles.
-- `src/main.rs` is still exactly what Step 2 produced: `no_std` / `no_main`, our
-  `_start`, our `#[panic_handler]`. It has not changed since.
-- `bootloader = "0.9.35"` in `[dependencies]`; `bootimage 0.10.5` installed;
-  `runner = "bootimage runner"` in `.cargo/config.toml`.
-- **`cargo run` boots the kernel in QEMU 8.2.2.** The window is black, and the CPU is
-  verified to be sitting in our `loop {}` at `RIP=0x201122` in long mode with paging on.
+- Dependencies: `bootloader = "0.9.35"` (read by `bootimage`, never linked into the
+  kernel) and `spin = "0.12.3"` (the spinlock behind the global `WRITER`).
+- `src/main.rs`: `_start` clears the screen and prints four lines; the panic handler
+  prints the `PanicInfo` in white on red and halts.
+- `src/vga_buffer.rs`: `Color`, `ColorCode`, `ScreenChar`, `Writer` with volatile cell
+  access and scrolling, `impl fmt::Write`, the global `WRITER`, and `print!`/`println!`.
+- **`cargo run` boots and the kernel prints to the screen.** Verified by `screendump`
+  from the QEMU monitor: normal output and the panic path both confirmed visually.
 - Warnings we are knowingly carrying: cargo's kebab-case binary-name suggestion, the
   future-incompatibility report about nightly's own `core` sources, and
-  `unused dependency 'bootloader'` (false alarm - `bootimage` reads it).
+  `unused dependency` for both `bootloader` and `spin` (both are used - `bootloader` by
+  an external tool, `spin` from `vga_buffer.rs`; the second warning is worth revisiting).
+- Known hazard, recorded in Step 6: `_print` holds the `WRITER` lock across its
+  `unwrap()`, so a panic from inside it would deadlock. Unreachable today.
 
 ## Next step
 
-Write something to the screen: the **VGA text buffer**.
+Testing. Right now every check has been a human looking at a screenshot, which does not
+scale and cannot run in a loop.
 
-**The gap.** We can boot, but we are blind. Every observation so far has come from
-outside the machine - `readelf`, `objdump`, the QEMU monitor. We need the kernel itself
-to tell us something.
+**The gap.** `cargo test` builds a test harness that lives in `std`: it needs a `main`,
+a runtime that collects `#[test]` functions, threads, and a process exit code to report
+success. We have none of those. So the test framework has to be ours.
 
-**Concept.** On a BIOS-booted PC in text mode, the screen is memory. Physical address
-`0xb8000` is the start of a 25-row by 80-column grid, two bytes per character cell: the
-first byte is the code point in **code page 437**, the second is the colour attribute
-(low nibble foreground, high nibble background). Writing `0x0f48` to `0xb8000` puts a
-white-on-black `H` in the top-left corner. There is no driver, no system call, no
-device - just a store instruction to an address the graphics hardware happens to watch.
+**Concept.** Three pieces, each interesting on its own:
 
-1. Write a byte pair to `0xb8000` from `_start` and see a character appear. This
-   requires `unsafe`: dereferencing a raw pointer, because the compiler cannot know
-   that this integer is a valid address.
-2. Understand why the naive version can be optimised away, and what `Volatile` is for:
-   the compiler sees a write to memory that is never read back and is entitled to
-   delete it. `volatile` marks the write as having an effect the compiler cannot see.
-3. Then build it into something civilised: a `Writer` struct that owns the buffer,
-   tracks a column position, handles `\n`, scrolls when the screen fills, and
-   implements `core::fmt::Write` so that formatting machinery works on it.
+1. **A custom test runner.** The unstable `#![feature(custom_test_frameworks)]` lets us
+   name our own function to receive the list of collected tests. It generates its own
+   entry point, which we redirect with `#[reexport_test_harness_main]` and call from
+   `_start`.
+2. **Telling the outside world the result.** A kernel cannot return an exit code —
+   nothing is waiting on it. The trick is QEMU's `isa-debug-exit` device: writing a
+   byte to an I/O port makes QEMU terminate with an exit status derived from it. This
+   introduces **port-mapped I/O**, the other half of how x86 talks to hardware: separate
+   `in` and `out` instructions with their own address space, distinct from the
+   memory-mapped I/O we used for the screen. We saw exactly this in the bootloader's
+   A20 code (`in al, 0x92` / `out 0x92, al`).
+3. **Serial output.** Screenshots are useless to a script. The 16550 UART on port
+   `0x3f8` is trivial to drive and QEMU can redirect it to stdout, so the kernel's
+   output becomes ordinary text in the terminal, capturable and greppable.
 
-**Rust concepts about to appear.** Raw pointers and `unsafe`; `repr(transparent)` and
-`repr(C)` for laying out structs the way hardware expects; enums with explicit
-discriminants; `&mut` and why exactly one mutable reference to the buffer is allowed;
-traits (`core::fmt::Write`) as the bridge to `write!`. Pause on any of these before
-moving past them.
+**Rust concepts about to appear.** Unstable features and `#![feature(...)]`; attribute
+macros; trait objects (`&[&dyn Fn()]`, the list of tests); `#[cfg(test)]` conditional
+compilation; and the `Testable` trait trick that makes each test print its own name.

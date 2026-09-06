@@ -175,8 +175,8 @@ Rough phil-opp order. Tick items off as `NOTES.md` records them.
 - [x] Freestanding Rust binary (`no_std`, `no_main`, panic handler, `_start`)
 - [x] Custom bare-metal target + `build-std`
 - [x] Bootable image with `bootimage`, booting in QEMU
-- [ ] VGA text buffer — printing to the screen
-- [ ] `println!` macro of our own
+- [x] VGA text buffer — printing to the screen
+- [x] `println!` macro of our own
 - [ ] Testing framework (custom test runner, QEMU exit codes, serial output)
 - [ ] CPU exceptions and the IDT (Interrupt Descriptor Table)
 - [ ] Double faults and the IST (Interrupt Stack Table)
