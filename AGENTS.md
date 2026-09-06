@@ -174,7 +174,7 @@ Rough phil-opp order. Tick items off as `NOTES.md` records them.
 
 - [x] Freestanding Rust binary (`no_std`, `no_main`, panic handler, `_start`)
 - [x] Custom bare-metal target + `build-std`
-- [ ] Bootable image with `bootimage`, booting in QEMU
+- [x] Bootable image with `bootimage`, booting in QEMU
 - [ ] VGA text buffer — printing to the screen
 - [ ] `println!` macro of our own
 - [ ] Testing framework (custom test runner, QEMU exit codes, serial output)
@@ -220,6 +220,11 @@ Rough phil-opp order. Tick items off as `NOTES.md` records them.
 ---
 
 ## 8. Useful commands
+
+The full list — build, ELF and raw-image inspection, QEMU, and the QEMU monitor —
+lives in the `Reference` section of `NOTES.md`, together with an explanation of every
+configuration file. Keep that section current; it is the one part of `NOTES.md` that
+is edited rather than appended to.
 
 ```bash
 rustc --version                 # confirm nightly is active in this directory
