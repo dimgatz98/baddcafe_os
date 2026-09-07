@@ -800,6 +800,120 @@ now so it is not discovered the hard way later.
 
 ---
 
+## Step 7 — A test framework of our own
+
+**Goal.** Make `cargo test` build and boot a kernel that runs our own tests and reports
+them, instead of a human squinting at a screenshot.
+
+**Concept.** `cargo test` normally builds a hidden `main` that lives in `std`: it
+collects every `#[test]` function, runs them on threads, catches panics via unwinding,
+and returns a process exit code. Every one of those four things is missing here. There
+is no `std`, no threads, no unwinder, and nothing above us to receive an exit code.
+
+Nightly offers a hook for exactly this situation: `#![feature(custom_test_frameworks)]`.
+It keeps the *collection* half of the machinery — the compiler still gathers annotated
+functions across the crate — and hands the result to a function we name. Everything
+after that is ours.
+
+Three attributes wire it up:
+
+```rust
+#![feature(custom_test_frameworks)]
+#![test_runner(crate::test_runner)]
+#![reexport_test_harness_main = "test_main"]
+```
+
+The collected functions are marked `#[test_case]`, not `#[test]` — `#[test]` belongs to
+the std harness. The generated entry point would normally be called `main`; since we are
+`#![no_main]` nobody would ever call it, so `reexport_test_harness_main` renames it to
+`test_main` and we call it ourselves from `_start`.
+
+**What we did.** Rewrote `src/main.rs`:
+
+- the three attributes above,
+- `fn test_runner(tests: &[&dyn Fn()])`, which prints the count and calls each test,
+- one `#[test_case] fn trivial_assertion()`,
+- split `_start`: `#[cfg(test)] test_main();` versus `#[cfg(not(test))] banner();`,
+  where `banner()` holds the four demo lines Step 6 left in `_start`.
+
+**What happened.** `cargo build` was clean. `cargo test` was not:
+
+```
+error[E0152]: duplicate lang item in crate `core`: `sized`
+  = note: the lang item is first defined in crate `core` (which `scopeguard` depends on)
+  = note: first definition in `core` loaded from  .../build/core/31f1e492433e93d4/out/libcore-....rmeta
+  = note: second definition in `core` loaded from .../build/core/ac70bd9dbb04c9ea/out/libcore-....rmeta
+error: could not compile `scopeguard` (lib) due to 1 previous error
+error: could not compile `bootloader` (lib) due to 1 previous error
+```
+
+Two copies of `core` in one build. A **lang item** is a definition the compiler itself
+depends on — `sized` is the `Sized` trait, which every generic bound mentions. Exactly
+one crate in a build may define it. `cargo test -v` showed the contradiction inside a
+single `rustc` invocation:
+
+```
+-L dependency=.../build/core/ac70bd9dbb04c9ea/out
+--extern noprelude,nounused:core=.../build/core/31f1e492433e93d4/out/libcore-31f1e492433e93d4.rmeta
+```
+
+One `core` named explicitly, a *different* `core` reachable on the library search path.
+
+Diffing the two fingerprints
+(`target/x86_64-baddcafe_os/debug/build/core/<hash>/fingerprint/lib-core.json`) isolated
+the cause: identical `rustc`, `features`, `target`, `path`, `config` — only `profile`
+differed. Cargo builds test targets under the `test` profile, and by default it forces
+`panic = "unwind"` there, because the std harness needs to catch a panicking test.
+Different panic strategy, different profile hash, second build of `core`.
+
+The fix is one unstable cargo flag in `.cargo/config.toml`:
+
+```toml
+[unstable]
+panic-abort-tests = true
+```
+
+It tells cargo that test targets may keep `panic = "abort"`, which is the only strategy
+this target has. With it, one `core`, and the build succeeds.
+
+Verified headless by dumping the text buffer straight out of guest memory:
+
+```
+22| Running 1 tests
+23| trivial assertion... [ok]
+```
+
+**Why.** The duplicate `core` was not a bug in our code at all — it was two build
+profiles disagreeing about a property (`panic`) that is baked into compiled code. This
+is the recurring shape of `build-std` problems: because the standard library is compiled
+*per build*, anything that changes compilation flags can silently fork it in two.
+Reading the fingerprint JSONs is the general technique for these — they are cargo
+showing its work about why two units are considered different.
+
+The `#[cfg(test)]` split matters for a subtler reason. `test_main` is generated *only*
+in a test build; without the `cfg` the normal build would fail on an undefined function.
+`banner()` gets `#[cfg(not(test))]` for the mirror reason: unused in a test build, it
+would warn as dead code.
+
+Running `cargo test` for real hangs, on purpose. The tests print and then fall into
+`loop {}`, because the kernel has no way to say "done" to anything outside itself. That
+is the next step.
+
+**Rust concepts touched.**
+
+- `#![feature(...)]` — opting into an unstable language feature, crate-wide.
+- `#[cfg(test)]` / `#[cfg(not(test))]` — conditional compilation. The item is not
+  compiled-then-skipped; it never reaches the compiler at all.
+- `&[&dyn Fn()]` — a slice of **trait objects**. Every function item and every closure
+  has its own unique, unnameable type, so a homogeneous array of them is impossible.
+  `dyn Fn()` erases the type: the reference becomes a *fat pointer*, two machine words —
+  the data, plus a vtable holding the address of `call`. The same idea as a Go
+  interface value, but visible in the type.
+- `for test in tests` over a `&[&dyn Fn()]` yields `&&dyn Fn()`; calling `test()`
+  works anyway because auto-deref applies through both references.
+
+---
+
 ## Reference — files, commands, and how to read the machine
 
 This section is not a journal entry. It is the lookup table: every configuration file
@@ -872,6 +986,7 @@ target = "x86_64-baddcafe_os.json"
 build-std = ["core", "compiler_builtins"]
 build-std-features = ["compiler-builtins-mem"]
 json-target-spec = true
+panic-abort-tests = true
 
 [target.'cfg(target_os = "none")']
 runner = "bootimage runner"
@@ -887,6 +1002,11 @@ runner = "bootimage runner"
 - `json-target-spec = true` — custom `.json` targets are gated behind their own
   unstable flag on current nightly. Without it: *"`.json` target specs require
   -Zjson-target-spec"*.
+- `panic-abort-tests = true` — cargo builds test targets under the `test` profile and
+  by default forces `panic = "unwind"` there, because the std test harness catches a
+  panicking test. That contradicts `panic = "abort"` everywhere else, and under
+  `build-std` it makes cargo compile a **second** `core`, which then collides with the
+  first over lang items. See Step 7.
 - `runner` — cargo cannot execute our binary; it is not a Linux program. This key says
   "instead of running it, hand it to `bootimage runner`", which builds the disk image
   and launches QEMU. That is what makes `cargo run` work.
@@ -913,7 +1033,8 @@ target is just a description it reads, not a separate build of the compiler.
 #### Source layout
 
 ```
-src/main.rs        `_start`, the panic handler, and `mod vga_buffer;`
+src/main.rs        `_start`, the panic handler, `mod vga_buffer;`, and the
+                   custom test runner
 src/vga_buffer.rs  the VGA text buffer: Color, ColorCode, ScreenChar, Writer,
                    the global WRITER, and the print!/println! macros
 ```
@@ -931,6 +1052,7 @@ rustup show active-toolchain    # confirm rust-toolchain.toml is being honoured
 cargo build                     # the main feedback loop
 cargo bootimage                 # build kernel + bootloader, produce the disk image
 cargo run                       # build, make the image, boot it in QEMU
+cargo test                      # build the test kernel, boot it, run the test cases
 ```
 
 Artifacts:
@@ -938,6 +1060,13 @@ Artifacts:
 ```
 target/x86_64-baddcafe_os/debug/baddcafe_os                  # the kernel ELF
 target/x86_64-baddcafe_os/debug/bootimage-baddcafe_os.bin    # the bootable disk image
+```
+
+The test kernel is a separate binary with a hash in its name; ask cargo for the path
+rather than guessing it:
+
+```bash
+cargo test --no-run --message-format=json | grep -o '"executable":"[^"]*"'
 ```
 
 #### Inspecting the kernel ELF
@@ -1020,8 +1149,31 @@ PPM image, which is how the kernel's output can be checked without a window:
 convert screen.ppm screen.png     # ImageMagick, for a viewable file
 ```
 
-This is currently our **only** way to see inside the kernel. Until we can write to the
-screen, the kernel cannot tell us anything itself.
+**Reading the screen as text.** A PPM needs eyes. `pmemsave` copies guest physical
+memory to a host file instead, and the text buffer decodes to plain characters — every
+even byte is an ASCII code, every odd byte its colour:
+
+```bash
+{ sleep 4; echo 'pmemsave 0xb8000 4000 "/abs/path/vga.bin"'; sleep 2; echo quit; } \
+  | qemu-system-x86_64 -drive format=raw,file=<img> -display none -monitor stdio
+
+python3 -c 'd=open("/abs/path/vga.bin","rb").read()
+for r in range(25):
+    print("".join(chr(c) if 32<=c<127 else " " for c in d[r*160:(r+1)*160:2]).rstrip())'
+```
+
+The quotes around the filename are required: unquoted, the monitor tries to parse the
+path as a numeric expression and fails with *"invalid char \'s\' in expression"*.
+
+To do the same for a **test** run, hand the test executable to `bootimage runner` and
+append the QEMU flags; the tool needs `CARGO_MANIFEST_DIR` when invoked outside cargo:
+
+```bash
+CARGO_MANIFEST_DIR=$PWD bootimage runner <test-exe> -display none -monitor stdio
+```
+
+This was our only way to see inside the kernel before it could print, and it stays the
+scriptable one until the serial port exists.
 
 ### R3. How a PC boots, decoded from our own image
 
@@ -1114,52 +1266,62 @@ evidence that all three rungs were climbed before control reached `_start`.
 
 ## Current state
 
-- Branch `master`. Committed: `75d458e` (steps 0-3), `d40df33` (step 4). Steps 5 and 6
-  are not committed yet.
+- Branch `master`. Committed: `75d458e` (steps 0-3), `d40df33` (step 4), `3fa414d`
+  (steps 5-6). Step 7 is not committed yet.
 - Toolchain: nightly `1.100.0-nightly (a69a63265 2026-09-03)`, pinned by
   `rust-toolchain.toml`, with `rust-src` and `llvm-tools-preview`.
-- Edition 2024. `panic = "abort"` on both profiles.
+- Edition 2024. `panic = "abort"` on both profiles, and `panic-abort-tests = true` in
+  `.cargo/config.toml` so the test profile agrees with them.
 - Dependencies: `bootloader = "0.9.35"` (read by `bootimage`, never linked into the
   kernel) and `spin = "0.12.3"` (the spinlock behind the global `WRITER`).
-- `src/main.rs`: `_start` clears the screen and prints four lines; the panic handler
-  prints the `PanicInfo` in white on red and halts.
+- `src/main.rs`: `_start` clears the screen, then calls `test_main()` in a test build or
+  `banner()` otherwise; the panic handler prints the `PanicInfo` in white on red and
+  halts. Below that, `test_runner` and one `#[test_case]`.
 - `src/vga_buffer.rs`: `Color`, `ColorCode`, `ScreenChar`, `Writer` with volatile cell
   access and scrolling, `impl fmt::Write`, the global `WRITER`, and `print!`/`println!`.
-- **`cargo run` boots and the kernel prints to the screen.** Verified by `screendump`
-  from the QEMU monitor: normal output and the panic path both confirmed visually.
+- **`cargo run` boots and prints. `cargo test` boots, runs the test case, and prints
+  `Running 1 tests` / `trivial assertion... [ok]`** — verified headless by dumping
+  `0xb8000` with `pmemsave` (R2).
 - Warnings we are knowingly carrying: cargo's kebab-case binary-name suggestion, the
   future-incompatibility report about nightly's own `core` sources, and
-  `unused dependency` for both `bootloader` and `spin` (both are used - `bootloader` by
-  an external tool, `spin` from `vga_buffer.rs`; the second warning is worth revisiting).
-- Known hazard, recorded in Step 6: `_print` holds the `WRITER` lock across its
-  `unwrap()`, so a panic from inside it would deadlock. Unreachable today.
+  `unused dependency` for `bootloader` (used by an external tool, not by our code).
+- Known hazards:
+  - `_print` holds the `WRITER` lock across its `unwrap()`, so a panic from inside it
+    would deadlock. Unreachable today.
+  - `cargo test` never terminates: the tests print and fall into `loop {}`. The run has
+    to be killed by hand.
 
 ## Next step
 
-Testing. Right now every check has been a human looking at a screenshot, which does not
-scale and cannot run in a loop.
+Make the test run **end**, and make its output readable by a script rather than by a
+memory dump. Two pieces.
 
-**The gap.** `cargo test` builds a test harness that lives in `std`: it needs a `main`,
-a runtime that collects `#[test]` functions, threads, and a process exit code to report
-success. We have none of those. So the test framework has to be ours.
+**1. Exiting QEMU from inside the guest.** A kernel has no parent process to return an
+exit code to. QEMU can be given a fake device for exactly this: `isa-debug-exit`, added
+with `-device isa-debug-exit,iobase=0xf4,iosize=0x04`. Writing a byte to port `0xf4`
+makes QEMU exit with status `(value << 1) | 1`. So the guest picks the status, and cargo
+sees a process that succeeded or failed.
 
-**Concept.** Three pieces, each interesting on its own:
+This introduces **port-mapped I/O**, the other half of how x86 talks to hardware.
+Memory-mapped I/O — what the VGA buffer is — puts device registers at ordinary memory
+addresses. Port-mapped I/O gives devices a *separate* 16-bit address space reachable
+only through the `in` and `out` instructions. We have already read this exact pattern in
+the bootloader's A20 code (Step 4, R3): `in al, 0x92` / `out 0x92, al`.
 
-1. **A custom test runner.** The unstable `#![feature(custom_test_frameworks)]` lets us
-   name our own function to receive the list of collected tests. It generates its own
-   entry point, which we redirect with `#[reexport_test_harness_main]` and call from
-   `_start`.
-2. **Telling the outside world the result.** A kernel cannot return an exit code —
-   nothing is waiting on it. The trick is QEMU's `isa-debug-exit` device: writing a
-   byte to an I/O port makes QEMU terminate with an exit status derived from it. This
-   introduces **port-mapped I/O**, the other half of how x86 talks to hardware: separate
-   `in` and `out` instructions with their own address space, distinct from the
-   memory-mapped I/O we used for the screen. We saw exactly this in the bootloader's
-   A20 code (`in al, 0x92` / `out 0x92, al`).
-3. **Serial output.** Screenshots are useless to a script. The 16550 UART on port
-   `0x3f8` is trivial to drive and QEMU can redirect it to stdout, so the kernel's
-   output becomes ordinary text in the terminal, capturable and greppable.
+Concretely: a `fn exit_qemu(code: QemuExitCode) -> !` writing a `u32` to `0xf4` via
+inline assembly (`core::arch::asm!` with the `out` instruction), an
+`#[repr(u32)] enum QemuExitCode { Success = 0x10, Failed = 0x11 }`, calls at the end of
+`test_runner` and in the panic handler, and `test-args` / `test-success-exit-code` under
+`[package.metadata.bootimage]` in `Cargo.toml` so `bootimage` passes the device flag and
+translates the odd exit status back to success.
 
-**Rust concepts about to appear.** Unstable features and `#![feature(...)]`; attribute
-macros; trait objects (`&[&dyn Fn()]`, the list of tests); `#[cfg(test)]` conditional
-compilation; and the `Testable` trait trick that makes each test print its own name.
+**2. Serial output.** A memory dump is not a test log. The 16550 UART at port `0x3f8` is
+a handful of `out` instructions, and `-serial stdio` redirects it to the terminal, so
+the kernel's output becomes ordinary greppable text. Same port-mapped I/O mechanism,
+second use of it — which is the point of doing them in this order.
+
+**Rust concepts about to appear.** `core::arch::asm!` and its operand syntax;
+`#[repr(u32)]` on an enum, and why the discriminant type must be pinned when the value
+crosses into hardware; the never type `!` on a diverging function; and, once serial
+exists, a `Testable` trait with a blanket `impl<T: Fn()> Testable for T` so every test
+prints its own name via `core::any::type_name`.
