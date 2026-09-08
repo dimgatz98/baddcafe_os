@@ -1103,6 +1103,168 @@ panics, control never returns to `Testable::run`, so nothing else can report it.
 - `-> !` on `exit_qemu`: the compiler cannot know the `out` instruction kills the
   machine, so the function still needs a `loop {}` to satisfy the never type.
 
+## Step 9 — The IDT, and the first exception we asked for
+
+**Goal.** Teach the CPU where to jump when an instruction cannot be completed, and
+prove it by triggering an exception on purpose and surviving it.
+
+**Concept.** Until now the CPU ran our code straight through. An **exception** is the
+CPU interrupting *itself*: it reaches an instruction it cannot finish — a division by
+zero, a memory access to an unmapped page, an invalid opcode — and instead of
+continuing it looks up a handler and jumps there. Vectors 0-31 are reserved for these;
+32-255 are for hardware and software interrupts.
+
+The table it looks in is the **IDT** (Interrupt Descriptor Table): 256 entries of 16
+bytes each, living anywhere in memory, with its address handed to the CPU by the
+`lidt` instruction. If the entry for a vector is not marked *present*, the CPU faults
+while trying to handle the fault — and a fault while handling *that* is a **triple
+fault**, which resets the machine. That is the reboot loop `-no-reboot` exists to stop.
+
+An entry is a strange shape, and the strangeness is historical:
+
+| Bytes | Field |
+|---|---|
+| 0-1 | handler address, bits 0-15 |
+| 2-3 | code segment selector to run the handler under |
+| 4-5 | options |
+| 6-7 | handler address, bits 16-31 |
+| 8-11 | handler address, bits 32-63 |
+| 12-15 | reserved |
+
+The address is split into three pieces because 64-bit mode widened a descriptor that
+already existed in 32-bit mode, and could not move the fields that were already there.
+The options word we write is `0x8e00`: bit 15 = present, bits 13-14 = DPL 0 (only ring
+0 may invoke it with `int`), bits 8-11 = type `0xe`, a 64-bit **interrupt gate**. Type
+`0xf` would be a *trap* gate; the only difference is that an interrupt gate clears the
+interrupt flag on entry, so the handler is not itself interrupted.
+
+**The calling convention is the real lesson.** A handler is not *called* — it is jumped
+to by hardware, at an arbitrary instruction boundary in unrelated code. Two consequences
+the normal C ABI gets wrong:
+
+1. **It must return with `iretq`, not `ret`.** The CPU pushed five values (instruction
+   pointer, code segment, flags, stack pointer, stack segment) and `iretq` pops exactly
+   those and restores the flags. `ret` would pop one value and leave the rest as
+   garbage.
+2. **It must preserve every register.** The System V ABI splits registers into
+   callee-saved and caller-saved; the caller-saved ones may be destroyed by a call
+   because the caller knew a call was coming. Here the "caller" is a random instruction
+   that knew nothing. So *all* registers must be restored.
+
+Rust cannot express this with `extern "C"`, so there is a dedicated, still-unstable
+convention: `extern "x86-interrupt"`, behind `#![feature(abi_x86_interrupt)]`. It also
+knows about the pushed frame — the handler takes an `InterruptStackFrame` argument —
+and about the exceptions that push an **error code** on top, which take a second `u64`.
+
+**What we did.** A new `src/idt.rs`, roughly 130 lines and no new dependency:
+
+```rust
+pub type HandlerFunc = extern "x86-interrupt" fn(InterruptStackFrame);
+
+#[repr(C)] struct Entry { offset_low, selector, options, offset_middle, offset_high, reserved }
+#[repr(C, align(16))] pub struct Idt { entries: [Entry; 256] }
+
+impl Idt {
+    pub const fn new() -> Idt;
+    pub fn set_handler(&mut self, vector: u8, handler: HandlerFunc);
+    pub fn load(&'static self);
+}
+```
+
+Three decisions worth naming:
+
+- **`load(&'static self)`.** `lidt` hands the CPU a raw address and the CPU keeps
+  reading that memory forever afterwards, long after `load` has returned. `&'static` is
+  how we state that in the type system: this table must outlive everything. A stack-local
+  IDT would compile without the bound and produce a machine that dies at the first
+  exception.
+- **The selector is *read*, not hardcoded.** `set_handler` executes `mov {}, cs` to
+  learn which code segment we are currently running under, rather than assuming the
+  bootloader's `0x8`. The value happens to be `0x8`, but the assumption would be
+  invisible the day we install our own GDT.
+- **`spin::Once<Idt>` for the global.** The table must be built at runtime (handler
+  addresses are not known at compile time) yet live in a `static`. `static mut` would
+  need `unsafe` at every touch and is lint-denied in edition 2024;
+  `core::cell::OnceCell` is not `Sync`; there is no `OnceLock` in `core`. `Once`
+  initialises exactly once behind a spinlock and hands back a `&'static Idt` — the
+  precise lifetime `load` demands.
+
+Then `init()` registers one handler on vector 3 and loads the table, `_start` calls it
+right after the serial port comes up, `banner()` executes `int3` on purpose, and a
+`#[test_case]` does the same and passes if execution simply continues.
+
+**What happened.** First build, clean. `cargo test`:
+
+```
+Running 2 tests
+baddcafe_os::breakpoint_exception_returns... EXCEPTION: BREAKPOINT
+InterruptStackFrame {
+    instruction_pointer: 2118217,
+    code_segment: 8,
+    cpu_flags: 6,
+    stack_pointer: 1099513732680,
+    stack_segment: 0,
+}
+[ok]
+baddcafe_os::trivial_assertion... [ok]
+```
+
+Correct, but decimal — a `#[derive(Debug)]` on a struct full of addresses. Replaced with
+a hand-written `impl fmt::Debug` that wraps each field in `format_args!("{:#x}", ...)`,
+the standard trick for changing a field's formatting inside `debug_struct`. `Formatter`
+stores an `Arguments` and prints it verbatim, so the field comes out in hex:
+
+```
+instruction_pointer: 0x2051c9,
+code_segment: 0x8,
+cpu_flags: 0x6,
+stack_pointer: 0x10000201e48,
+stack_segment: 0x0,
+```
+
+And the normal boot, read off the screen with `pmemsave`:
+
+```
+15| EXCEPTION: BREAKPOINT
+16| InterruptStackFrame {
+...
+22| }
+23| ...and we came back from the exception.
+```
+
+That last line is the whole point: the CPU left our code, ran a function we registered,
+and `iretq` put it back exactly where it was.
+
+**Why.** `cpu_flags: 0x2` on the real boot is worth a look — bit 1 of RFLAGS is a
+reserved bit that is always 1, so `0x2` means "no flags set at all". In the test run it
+was `0x6`, which adds bit 2, the parity flag, left over from the `assert_eq!` that ran
+just before. The frame is a snapshot of the interrupted code, and it shows.
+
+`instruction_pointer` points at the instruction *after* `int3`, because a breakpoint is
+a **trap**: it reports something that already happened, so execution resumes past it.
+Faults (page fault, general protection fault) report something that has *not* happened
+and push the address of the offending instruction itself, so that a handler can fix the
+situation and retry. Aborts (double fault) do not promise anything useful at all.
+
+**Rust concepts touched.**
+
+- `extern "x86-interrupt"` — a calling convention as a language feature, because the
+  return instruction and the register-saving rules are not something a library can add.
+- `#![feature(...)]` again: `abi_x86_interrupt` is unstable, which is one more reason
+  this project is pinned to nightly.
+- `#[repr(C, align(16))]` — layout dictated by hardware, not by the compiler's
+  preferences. `#[repr(C, packed)]` on the `lidt` operand for the opposite reason: the
+  6-byte pointer has a `u16` followed by a `u64` with no padding between them, which no
+  compiler would choose on its own.
+- `&'static self` as an API constraint. The lifetime is not documentation here; it is
+  the thing that makes a whole class of bug impossible.
+- Function pointers as values: `handler as u64` is the address of the code, and a
+  function item coerces to a function pointer on the way.
+- `format_args!` inside `debug_struct().field(...)` — `Arguments` implements `Debug` by
+  printing itself, so it is the way to override formatting of one field.
+- `spin::Once<T>` vs `static mut`: deferred initialisation of a global without `unsafe`,
+  and why `&'static` falls out of it for free.
+
 ---
 
 ## Reference — files, commands, and how to read the machine
@@ -1243,6 +1405,8 @@ src/main.rs        `_start`, the panic handlers, the module declarations, the
                    custom test runner, the Testable trait, and exit_qemu
 src/vga_buffer.rs  the VGA text buffer: Color, ColorCode, ScreenChar, Writer,
                    the global WRITER, and the print!/println! macros
+src/idt.rs         the Interrupt Descriptor Table: Entry, Idt, InterruptStackFrame,
+                   the breakpoint handler, and init()
 src/port.rs        port-mapped I/O primitives: outb, outl, inb
 src/serial.rs      the 16550 UART on COM1: Serial, the global SERIAL, and the
                    serial_print!/serial_println! macros
@@ -1490,73 +1654,76 @@ evidence that all three rungs were climbed before control reached `_start`.
 ## Current state
 
 - Branch `master`. Committed: `75d458e` (steps 0-3), `d40df33` (step 4), `3fa414d`
-  (steps 5-6), `ae7a1a8` (step 7). Step 8 is committed alongside this entry.
+  (steps 5-6), `ae7a1a8` (step 7), `da2a262` (step 8). Step 9 is committed alongside
+  this entry.
 - Toolchain: nightly `1.100.0-nightly (a69a63265 2026-09-03)`, pinned by
   `rust-toolchain.toml`, with `rust-src` and `llvm-tools-preview`.
-- Edition 2024. `panic = "abort"` on both profiles, and `panic-abort-tests = true` in
-  `.cargo/config.toml` so the test profile agrees with them.
-- Dependencies: `bootloader = "0.9.35"` (read by `bootimage`, never linked into the
-  kernel) and `spin = "0.12.3"` (the spinlock behind `WRITER` and `SERIAL`).
-- `src/main.rs`: `_start` initialises the UART, clears the screen, then calls
-  `test_main()` in a test build or `banner()` otherwise. Two panic handlers, split on
-  `cfg(test)`: the normal one prints white-on-red to the screen and halts, the test one
-  prints to serial and exits QEMU with `Failed`. Below them, `QemuExitCode`, `exit_qemu`,
-  the `Testable` trait with its blanket impl, `test_runner`, and one `#[test_case]`.
-- `src/port.rs`: `outb`, `outl`, `inb` over `core::arch::asm!`.
-- `src/serial.rs`: the 16550 UART on COM1 (`0x3f8`), `impl fmt::Write`, the global
-  `SERIAL`, and `serial_print!` / `serial_println!`.
-- `src/vga_buffer.rs`: unchanged since Step 6.
-- **`cargo run` boots, prints to the screen and to serial. `cargo test` boots, names and
-  runs the test case on serial, exits by itself with status 0** — verified, including the
-  failure path (a broken assertion gives `[failed]`, the panic message, and status 35).
+- Edition 2024. `panic = "abort"` on both profiles, `panic-abort-tests = true`.
+  Unstable features in use: `custom_test_frameworks`, `abi_x86_interrupt`.
+- Dependencies: `bootloader = "0.9.35"` (read by `bootimage`, never linked) and
+  `spin = "0.12.3"` (`Mutex` behind `WRITER`/`SERIAL`, `Once` behind `IDT`).
+- `src/main.rs`: `_start` initialises the UART, loads the IDT, clears the screen, then
+  runs `test_main()` or `banner()`. Two panic handlers split on `cfg(test)`.
+  `QemuExitCode`, `exit_qemu`, `Testable` + blanket impl, `test_runner`, two test cases.
+- `src/idt.rs`: hand-written IDT — 16-byte `Entry`, `#[repr(C, align(16))] Idt`,
+  `InterruptStackFrame` with a hex `Debug`, `lidt` via `DescriptorTablePointer`, the
+  code-segment selector read out of `cs`, a global `spin::Once<Idt>`, and a breakpoint
+  handler on vector 3.
+- `src/port.rs`: `outb`, `outl`, `inb`. `src/serial.rs`: the 16550 UART on COM1.
+  `src/vga_buffer.rs`: unchanged since Step 6.
+- **`cargo run` boots, prints, takes a breakpoint exception and comes back.
+  `cargo test` runs 2 tests on serial and exits 0.** Both verified; the failure path
+  (broken assertion → `[failed]`, panic message, status 35) verified in Step 8.
 - Warnings we are knowingly carrying: cargo's kebab-case binary-name suggestion, the
-  future-incompatibility report about nightly's own `core` sources, and
-  `unused dependency` for `bootloader` (used by an external tool, not by our code).
-  `outl` carries an explicit `#[allow(dead_code)]`: its only caller today is inside
-  `#[cfg(test)]` code, but the PIC and the timer will use it shortly.
+  future-incompatibility report about nightly's own `core` sources, `unused dependency`
+  for `bootloader`, and an explicit `#[allow(dead_code)]` on `outl`.
 - Known hazards:
-  - `_print` and `serial::_print` hold their lock across `unwrap()`, so a panic raised
-    from inside either would deadlock. Unreachable today; it becomes reachable the moment
-    an interrupt handler prints, which is the next step but one.
-  - Tests live in `src/main.rs` only. There is no library target yet, so integration
-    tests under `tests/` are not possible — that split is coming when double faults need
-    a test kernel of their own.
+  - `_print` and `serial::_print` hold their lock across `unwrap()`. The breakpoint
+    handler prints, so this is no longer theoretical: an exception raised while the main
+    code holds the `WRITER` lock deadlocks the machine. It cannot happen today because
+    the only exception we take is one we asked for, at a point where no lock is held. It
+    becomes real the moment hardware interrupts arrive, and the fix is to disable
+    interrupts around the lock.
+  - Only vector 3 is present. Every other exception — including a page fault or a
+    general protection fault caused by our own bug — still triple-faults and resets the
+    machine. That is the next step.
+  - Tests live in `src/main.rs` only; there is no library target, so `tests/` integration
+    tests are not possible yet.
 
 ## Next step
 
-**CPU exceptions and the IDT (Interrupt Descriptor Table).**
+**Double faults, and giving them a stack of their own (GDT, TSS, IST).**
 
-Until now the CPU has only ever run our code straight through. An **exception** is the
-CPU interrupting itself: it hits an instruction it cannot complete — a division by zero,
-a jump to an unmapped page, an invalid opcode — and, instead of continuing, it looks up a
-handler and calls it. Vectors 0-31 are reserved for these; 32-255 are for hardware and
-software interrupts (see `guides/GUIDE1.md` section 5). Without a handler the CPU faults
-while trying to fault, and a third fault triple-faults the machine: the reboot loop
-`-no-reboot` exists to stop.
+A **double fault** (vector 8) is what the CPU raises when it fails to invoke the handler
+for a first exception — most often because that handler is simply not present. It is the
+kernel's safety net: catching it turns a silent reboot into a message. The first half of
+the step is small: register a handler for vector 8 and watch a deliberate page fault
+produce a readable panic instead of a reset.
 
-The table it looks in is the **IDT**, 256 entries, its address loaded into the CPU with
-the `lidt` instruction. Each entry holds the handler's address, the code segment selector
-to run it under, and flags. On x86-64 an entry is 16 bytes.
+The second half is the interesting one, and it is where the x86 gets honest about
+stacks. If the first exception was a **stack overflow**, the stack pointer is already
+past the bottom of the stack, on a guard page. The CPU then tries to *push* the
+interrupt stack frame for the double-fault handler onto that same broken stack, fails
+again, and triple-faults. The handler is never reached. The only fix is hardware:
 
-The pieces:
+- The **TSS** (Task State Segment) is a structure that, in 64-bit mode, exists mostly to
+  hold two arrays of stack pointers. One of them is the **IST** (Interrupt Stack Table),
+  seven addresses of known-good stacks.
+- An IDT entry's options word has a 3-bit **IST index** field. Set it, and the CPU
+  *unconditionally* switches to that stack before pushing anything — no matter what the
+  current stack pointer was.
+- The TSS is reachable only through a descriptor in the **GDT** (Global Descriptor
+  Table), so we must build a GDT of our own — the bootloader's is not ours to extend —
+  and load it with `lgdt`, plus `ltr` to tell the CPU which entry is the TSS.
 
-1. An entry type (`#[repr(C)]`, the address split across three fields because the format
-   is a historical accretion), an options word, and a 256-entry `#[repr(C, align(16))]`
-   table.
-2. `x86-interrupt` calling convention (`extern "x86-interrupt"`, an unstable feature).
-   A handler is not called — it is *jumped to* by hardware, and it must return with
-   `iretq`, not `ret`. The hardware has already pushed an `InterruptStackFrame`
-   (instruction pointer, code segment, flags, stack pointer, stack segment), and some
-   exceptions push an error code on top, changing the handler's signature. This is why
-   the convention must exist at all: the normal C ABI gets both the return instruction
-   and the stack layout wrong.
-3. A breakpoint handler (vector 3) that prints and returns, plus `int3` in `_start` to
-   fire it deliberately — the first exception we *want*.
-4. A `#[test_case]` that executes `int3` and passes if execution continues, which is
-   exactly the kind of test the serial port and `exit_qemu` were built for.
+The pieces: a `static` stack (a plain `[u8; N]` array, since there is no allocator), a
+`Tss` with `#[repr(C, packed)]`, a `Gdt` holding a null entry, a kernel code segment and
+a 16-byte system descriptor for the TSS, `set_handler` gaining an IST index argument,
+and a test that overflows the stack on purpose and passes only if the double-fault
+handler runs.
 
-**Rust concepts about to appear.** `extern "x86-interrupt"` and why a calling convention
-is a language feature; `#[repr(C, align(N))]` and hardware-dictated layout; function
-pointers as struct fields; `lazy_static` or a `static mut`-free way to build a table that
-must live at a fixed address for the lifetime of the kernel, and why `spin::Once` /
-`OnceCell` is the honest answer in a kernel with no heap.
+**Rust concepts about to appear.** `static` arrays as memory with a fixed address, and
+taking their address safely; why a TSS descriptor is 16 bytes while a code descriptor is
+8, and how a `#[repr(C)]` type expresses that; `unsafe` blocks whose invariant is "this
+index is one we registered ourselves"; and the split of the crate into a library plus a
+binary, so that a stack-overflow test can live in its own kernel under `tests/`.

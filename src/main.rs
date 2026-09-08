@@ -1,9 +1,11 @@
 #![no_std]
 #![no_main]
+#![feature(abi_x86_interrupt)]
 #![feature(custom_test_frameworks)]
 #![test_runner(crate::test_runner)]
 #![reexport_test_harness_main = "test_main"]
 
+mod idt;
 mod port;
 mod serial;
 mod vga_buffer;
@@ -14,6 +16,7 @@ use vga_buffer::WRITER;
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
     serial::SERIAL.lock().init();
+    idt::init();
     WRITER.lock().clear_screen();
 
     #[cfg(test)]
@@ -40,6 +43,12 @@ fn banner() {
         .lock()
         .set_color(ColorCode::new(Color::LightGreen, Color::Black));
     println!("println! works, and it formats: {} + {} = {}", 2, 2, 2 + 2);
+
+    WRITER
+        .lock()
+        .set_color(ColorCode::new(Color::LightGray, Color::Black));
+    idt::int3();
+    println!("...and we came back from the exception.");
 }
 
 #[cfg(not(test))]
@@ -104,4 +113,9 @@ fn test_runner(tests: &[&dyn Testable]) {
 #[test_case]
 fn trivial_assertion() {
     assert_eq!(1 + 1, 2);
+}
+
+#[test_case]
+fn breakpoint_exception_returns() {
+    idt::int3();
 }

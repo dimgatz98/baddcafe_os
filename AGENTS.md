@@ -178,7 +178,7 @@ Rough phil-opp order. Tick items off as `NOTES.md` records them.
 - [x] VGA text buffer — printing to the screen
 - [x] `println!` macro of our own
 - [x] Testing framework (custom test runner, QEMU exit codes, serial output)
-- [ ] CPU exceptions and the IDT (Interrupt Descriptor Table)
+- [x] CPU exceptions and the IDT (Interrupt Descriptor Table)
 - [ ] Double faults and the IST (Interrupt Stack Table)
 - [ ] Hardware interrupts — PIC, timer, keyboard
 - [ ] Paging and virtual memory
