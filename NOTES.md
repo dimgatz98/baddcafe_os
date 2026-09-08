@@ -914,6 +914,197 @@ is the next step.
 
 ---
 
+## Step 8 — Port-mapped I/O: the test run ends by itself, and speaks in text
+
+**Goal.** Two things Step 7 left broken: `cargo test` never terminated, and its output
+was only visible by dumping guest memory. Fix both. They turn out to be the same
+mechanism twice.
+
+**Concept.** x86 has **two** address spaces, not one.
+
+- **Memory-mapped I/O** is what we already use. The device's registers sit at ordinary
+  memory addresses (`0xb8000`) and a plain `mov` reaches them.
+- **Port-mapped I/O** is a *separate* 16-bit space — 65536 "ports" — reachable only
+  through the `in` and `out` instructions. No pointer can name it. It does not go
+  through the MMU and it is not cached. We had already read this pattern in the
+  bootloader's A20 code (R3): `in al, 0x92` / `out 0x92, al`.
+
+Both devices in this step live in that second space: QEMU's `isa-debug-exit` at port
+`0xf4`, and the 16550 UART (the serial port) at `0x3f8`.
+
+**A kernel has no parent process**, so it has no exit code to return. `cargo test`
+decides pass/fail purely from an exit code. `isa-debug-exit` is a fake device that
+bridges the gap: write a `u32` to its port and QEMU terminates with process status
+`(value << 1) | 1`. The `| 1` makes the status always odd, therefore never `0`,
+therefore always "failure" to cargo — unless we tell cargo which odd number means
+success.
+
+**What we did.**
+
+`src/port.rs` — the primitives, three functions around `core::arch::asm!`:
+
+```rust
+pub unsafe fn outb(port: u16, value: u8)
+pub unsafe fn outl(port: u16, value: u32)
+pub unsafe fn inb(port: u16) -> u8
+```
+
+Each is one instruction with explicit registers, e.g.
+
+```rust
+asm!("out dx, al", in("dx") port, in("al") value,
+     options(nomem, nostack, preserves_flags));
+```
+
+The `in("dx")`/`in("al")` form pins the operand to a specific register, because `out`
+takes no others: the port number must be in `dx`, the payload in `al`/`ax`/`eax`. The
+`options` are promises to the optimiser — this asm touches no memory, does not use the
+stack, and leaves the flags register alone — so it may be moved and cached freely.
+`unsafe` because writing an arbitrary I/O port can do arbitrary things to the machine,
+and no type system can check which port is safe.
+
+`src/main.rs` — the exit path, test-only for now:
+
+```rust
+#[repr(u32)]
+pub enum QemuExitCode { Success = 0x10, Failed = 0x11 }
+
+pub fn exit_qemu(code: QemuExitCode) -> !
+```
+
+called at the end of `test_runner` (`Success`) and from the test build's panic handler
+(`Failed`).
+
+`src/serial.rs` — the UART. Six `out`s to configure it, then one poll-and-write per
+byte. Its register map is the interesting part: the chip has more registers than the
+eight ports it was given, so bit 7 of the line-control register (**DLAB**, Divisor
+Latch Access Bit) *changes what the first two ports mean*. Bank switching, 1980-style.
+
+| Offset | Role | With DLAB set |
+|---|---|---|
+| +0 | data in / out | divisor, low byte |
+| +1 | interrupt enable | divisor, high byte |
+| +2 | FIFO control | |
+| +3 | line control (bit 7 = DLAB) | |
+| +4 | modem control | |
+| +5 | line status (bit 5 = transmitter empty) | |
+
+The init sequence: interrupts off (`0x00`) — we have no IDT yet; DLAB on (`0x80`);
+divisor `3`, giving 115200/3 = 38400 baud; `0x03` = 8 data bits, no parity, 1 stop
+bit, and DLAB back off; `0xc7` = FIFOs on and cleared; `0x0b` = DTR, RTS and OUT2
+asserted. Sending a byte means spinning on line-status bit 5 until the transmit holding
+register is empty, then writing the byte. Busy-wait, because interrupts do not exist
+yet.
+
+On top of it, the exact shape of `vga_buffer.rs`: an `impl fmt::Write`, a global
+`static SERIAL: Mutex<Serial>`, and `serial_print!` / `serial_println!`.
+
+`Cargo.toml` — the flags `bootimage` passes to QEMU:
+
+```toml
+[package.metadata.bootimage]
+run-args = ["-serial", "stdio"]
+test-args = [
+    "-device", "isa-debug-exit,iobase=0xf4,iosize=0x04",
+    "-serial", "stdio",
+    "-display", "none",
+]
+test-success-exit-code = 33
+```
+
+`33` is `(0x10 << 1) | 1`. It is written as a literal in a different file from the enum
+that produces it — change one without the other and the build breaks silently.
+
+Finally the runner learned to name its tests. A trait with a blanket implementation:
+
+```rust
+pub trait Testable { fn run(&self); }
+
+impl<T: Fn()> Testable for T {
+    fn run(&self) {
+        serial_print!("{}... ", core::any::type_name::<T>());
+        self();
+        serial_println!("[ok]");
+    }
+}
+```
+
+and `test_runner(tests: &[&dyn Testable])`. Each test now prints its own name, so the
+test cases themselves shrank to just their assertion.
+
+**What happened.** `cargo test`:
+
+```
+Running: `qemu-system-x86_64 -drive format=raw,file=...bootimage-baddcafe_os-....bin
+  -no-reboot -device isa-debug-exit,iobase=0xf4,iosize=0x04 -serial stdio -display none`
+Running 1 tests
+baddcafe_os::trivial_assertion... [ok]
+$ echo $?
+0
+```
+
+It terminates on its own, and the output is ordinary text on stdout. Breaking the
+assertion on purpose (`assert_eq!(1 + 1, 3)`):
+
+```
+[failed]
+panicked at src/main.rs:106:5:
+assertion `left == right` failed
+  left: 2
+ right: 3
+$ echo $?
+35
+```
+
+`35` is `(0x11 << 1) | 1`, which is not the declared success code, so cargo reports
+failure. The normal build talks too:
+
+```
+$ timeout 6 qemu-system-x86_64 -drive format=raw,file=<img> -display none \
+      -serial file:/tmp/ser.txt
+$ cat /tmp/ser.txt
+BaddCafe OS: serial is alive on COM1
+```
+
+One warning appeared and was dealt with deliberately: `outl` is dead code in a non-test
+build, because the only caller is `exit_qemu`, which is `#[cfg(test)]`. It carries an
+`#[allow(dead_code)]` — the same treatment `Color` already has — rather than being
+gated on `test`, because it is a hardware primitive the PIC and the timer will use in a
+few steps.
+
+**Why.** The exit device is not a real machine feature; it is a debugging hook QEMU
+provides precisely because the guest cannot otherwise report a result. The serial port
+*is* real, and it is the oldest and simplest output a PC has: no framebuffer layout, no
+scrolling, no memory mapping — a byte goes in one end and comes out on the host's
+terminal. That property makes it the right channel for machine-readable output and,
+later, for panic messages that must survive a broken screen.
+
+The `[failed]` line is printed by the panic handler, not by the runner: once a test
+panics, control never returns to `Testable::run`, so nothing else can report it.
+
+**Rust concepts touched.**
+
+- `core::arch::asm!` — operands are `in(...)`/`out(...)` bound to a register *class* or,
+  as here, to a named register. `options(...)` are guarantees the compiler cannot verify
+  and must be told.
+- Edition 2024: the body of an `unsafe fn` is no longer implicitly an unsafe block
+  (`unsafe_op_in_unsafe_fn` is deny-by-default), so each `asm!` sits in its own explicit
+  `unsafe { }`.
+- `#[repr(u32)]` on an enum pins the discriminant's size. Without it the compiler picks
+  the smallest type that fits — here `u8` — and the value's layout would be its private
+  business. Once a value crosses into hardware, layout stops being private.
+- A **blanket impl** — `impl<T: Fn()> Testable for T` — implements our trait for every
+  type that is callable, closures included. It is allowed because the trait is ours; the
+  orphan rule only forbids implementing a foreign trait for a foreign type.
+- `core::any::type_name::<T>()` returns a compile-time string. Every function has its own
+  unnameable type, so the generic parameter *is* the identity of the test, and its name
+  is available with no runtime reflection and no allocation — which is why it works in
+  `no_std`.
+- `-> !` on `exit_qemu`: the compiler cannot know the `out` instruction kills the
+  machine, so the function still needs a `loop {}` to satisfy the never type.
+
+---
+
 ## Reference — files, commands, and how to read the machine
 
 This section is not a journal entry. It is the lookup table: every configuration file
@@ -952,6 +1143,15 @@ name = "baddcafe_os"
 version = "0.1.0"
 edition = "2024"
 
+[package.metadata.bootimage]
+run-args = ["-serial", "stdio"]
+test-args = [
+    "-device", "isa-debug-exit,iobase=0xf4,iosize=0x04",
+    "-serial", "stdio",
+    "-display", "none",
+]
+test-success-exit-code = 33
+
 [dependencies]
 bootloader = "0.9.35"
 spin = "0.12.3"
@@ -974,7 +1174,13 @@ panic = "abort"
   `bootimage`, an external tool, can read the manifest and learn which bootloader
   version to build. Cargo warns `unused dependency`; the warning is wrong for our case.
 - `spin = "0.12.3"` — a spinlock. There is no operating system to put a waiting thread
-  to sleep, so a contended lock loops instead. Used for the global `WRITER`.
+  to sleep, so a contended lock loops instead. Used for the global `WRITER` and `SERIAL`.
+- `[package.metadata.bootimage]` — cargo ignores this table; `bootimage` reads it.
+  `run-args` and `test-args` are appended to the QEMU command line for `cargo run` and
+  `cargo test`. `test-success-exit-code = 33` is `(0x10 << 1) | 1`: the status QEMU
+  produces when the kernel writes `QemuExitCode::Success` to the `isa-debug-exit` port.
+  Without it every test run would look like a failure, because that device's status is
+  always odd.
 
 #### `.cargo/config.toml` — how cargo behaves in this directory
 
@@ -1033,10 +1239,13 @@ target is just a description it reads, not a separate build of the compiler.
 #### Source layout
 
 ```
-src/main.rs        `_start`, the panic handler, `mod vga_buffer;`, and the
-                   custom test runner
+src/main.rs        `_start`, the panic handlers, the module declarations, the
+                   custom test runner, the Testable trait, and exit_qemu
 src/vga_buffer.rs  the VGA text buffer: Color, ColorCode, ScreenChar, Writer,
                    the global WRITER, and the print!/println! macros
+src/port.rs        port-mapped I/O primitives: outb, outl, inb
+src/serial.rs      the 16550 UART on COM1: Serial, the global SERIAL, and the
+                   serial_print!/serial_println! macros
 ```
 
 #### Toolchain sanity
@@ -1172,8 +1381,22 @@ append the QEMU flags; the tool needs `CARGO_MANIFEST_DIR` when invoked outside 
 CARGO_MANIFEST_DIR=$PWD bootimage runner <test-exe> -display none -monitor stdio
 ```
 
-This was our only way to see inside the kernel before it could print, and it stays the
-scriptable one until the serial port exists.
+This was our only way to see inside the kernel before it could print. Since Step 8 the
+serial port does the same job in plain text, so the memory dump is now only for
+inspecting the screen itself.
+
+#### Serial
+
+```bash
+# serial to the terminal (what run-args/test-args do)
+qemu-system-x86_64 -drive format=raw,file=<img> -display none -serial stdio
+
+# serial to a file, which survives a run killed by timeout
+qemu-system-x86_64 -drive format=raw,file=<img> -display none -serial file:/abs/path/ser.txt
+```
+
+With `-serial stdio` a run terminated by `timeout` can lose its buffered output to the
+pipe; `-serial file:` never does, so prefer it in scripts.
 
 ### R3. How a PC boots, decoded from our own image
 
@@ -1267,61 +1490,73 @@ evidence that all three rungs were climbed before control reached `_start`.
 ## Current state
 
 - Branch `master`. Committed: `75d458e` (steps 0-3), `d40df33` (step 4), `3fa414d`
-  (steps 5-6). Step 7 is not committed yet.
+  (steps 5-6), `ae7a1a8` (step 7). Step 8 is committed alongside this entry.
 - Toolchain: nightly `1.100.0-nightly (a69a63265 2026-09-03)`, pinned by
   `rust-toolchain.toml`, with `rust-src` and `llvm-tools-preview`.
 - Edition 2024. `panic = "abort"` on both profiles, and `panic-abort-tests = true` in
   `.cargo/config.toml` so the test profile agrees with them.
 - Dependencies: `bootloader = "0.9.35"` (read by `bootimage`, never linked into the
-  kernel) and `spin = "0.12.3"` (the spinlock behind the global `WRITER`).
-- `src/main.rs`: `_start` clears the screen, then calls `test_main()` in a test build or
-  `banner()` otherwise; the panic handler prints the `PanicInfo` in white on red and
-  halts. Below that, `test_runner` and one `#[test_case]`.
-- `src/vga_buffer.rs`: `Color`, `ColorCode`, `ScreenChar`, `Writer` with volatile cell
-  access and scrolling, `impl fmt::Write`, the global `WRITER`, and `print!`/`println!`.
-- **`cargo run` boots and prints. `cargo test` boots, runs the test case, and prints
-  `Running 1 tests` / `trivial assertion... [ok]`** — verified headless by dumping
-  `0xb8000` with `pmemsave` (R2).
+  kernel) and `spin = "0.12.3"` (the spinlock behind `WRITER` and `SERIAL`).
+- `src/main.rs`: `_start` initialises the UART, clears the screen, then calls
+  `test_main()` in a test build or `banner()` otherwise. Two panic handlers, split on
+  `cfg(test)`: the normal one prints white-on-red to the screen and halts, the test one
+  prints to serial and exits QEMU with `Failed`. Below them, `QemuExitCode`, `exit_qemu`,
+  the `Testable` trait with its blanket impl, `test_runner`, and one `#[test_case]`.
+- `src/port.rs`: `outb`, `outl`, `inb` over `core::arch::asm!`.
+- `src/serial.rs`: the 16550 UART on COM1 (`0x3f8`), `impl fmt::Write`, the global
+  `SERIAL`, and `serial_print!` / `serial_println!`.
+- `src/vga_buffer.rs`: unchanged since Step 6.
+- **`cargo run` boots, prints to the screen and to serial. `cargo test` boots, names and
+  runs the test case on serial, exits by itself with status 0** — verified, including the
+  failure path (a broken assertion gives `[failed]`, the panic message, and status 35).
 - Warnings we are knowingly carrying: cargo's kebab-case binary-name suggestion, the
   future-incompatibility report about nightly's own `core` sources, and
   `unused dependency` for `bootloader` (used by an external tool, not by our code).
+  `outl` carries an explicit `#[allow(dead_code)]`: its only caller today is inside
+  `#[cfg(test)]` code, but the PIC and the timer will use it shortly.
 - Known hazards:
-  - `_print` holds the `WRITER` lock across its `unwrap()`, so a panic from inside it
-    would deadlock. Unreachable today.
-  - `cargo test` never terminates: the tests print and fall into `loop {}`. The run has
-    to be killed by hand.
+  - `_print` and `serial::_print` hold their lock across `unwrap()`, so a panic raised
+    from inside either would deadlock. Unreachable today; it becomes reachable the moment
+    an interrupt handler prints, which is the next step but one.
+  - Tests live in `src/main.rs` only. There is no library target yet, so integration
+    tests under `tests/` are not possible — that split is coming when double faults need
+    a test kernel of their own.
 
 ## Next step
 
-Make the test run **end**, and make its output readable by a script rather than by a
-memory dump. Two pieces.
+**CPU exceptions and the IDT (Interrupt Descriptor Table).**
 
-**1. Exiting QEMU from inside the guest.** A kernel has no parent process to return an
-exit code to. QEMU can be given a fake device for exactly this: `isa-debug-exit`, added
-with `-device isa-debug-exit,iobase=0xf4,iosize=0x04`. Writing a byte to port `0xf4`
-makes QEMU exit with status `(value << 1) | 1`. So the guest picks the status, and cargo
-sees a process that succeeded or failed.
+Until now the CPU has only ever run our code straight through. An **exception** is the
+CPU interrupting itself: it hits an instruction it cannot complete — a division by zero,
+a jump to an unmapped page, an invalid opcode — and, instead of continuing, it looks up a
+handler and calls it. Vectors 0-31 are reserved for these; 32-255 are for hardware and
+software interrupts (see `guides/GUIDE1.md` section 5). Without a handler the CPU faults
+while trying to fault, and a third fault triple-faults the machine: the reboot loop
+`-no-reboot` exists to stop.
 
-This introduces **port-mapped I/O**, the other half of how x86 talks to hardware.
-Memory-mapped I/O — what the VGA buffer is — puts device registers at ordinary memory
-addresses. Port-mapped I/O gives devices a *separate* 16-bit address space reachable
-only through the `in` and `out` instructions. We have already read this exact pattern in
-the bootloader's A20 code (Step 4, R3): `in al, 0x92` / `out 0x92, al`.
+The table it looks in is the **IDT**, 256 entries, its address loaded into the CPU with
+the `lidt` instruction. Each entry holds the handler's address, the code segment selector
+to run it under, and flags. On x86-64 an entry is 16 bytes.
 
-Concretely: a `fn exit_qemu(code: QemuExitCode) -> !` writing a `u32` to `0xf4` via
-inline assembly (`core::arch::asm!` with the `out` instruction), an
-`#[repr(u32)] enum QemuExitCode { Success = 0x10, Failed = 0x11 }`, calls at the end of
-`test_runner` and in the panic handler, and `test-args` / `test-success-exit-code` under
-`[package.metadata.bootimage]` in `Cargo.toml` so `bootimage` passes the device flag and
-translates the odd exit status back to success.
+The pieces:
 
-**2. Serial output.** A memory dump is not a test log. The 16550 UART at port `0x3f8` is
-a handful of `out` instructions, and `-serial stdio` redirects it to the terminal, so
-the kernel's output becomes ordinary greppable text. Same port-mapped I/O mechanism,
-second use of it — which is the point of doing them in this order.
+1. An entry type (`#[repr(C)]`, the address split across three fields because the format
+   is a historical accretion), an options word, and a 256-entry `#[repr(C, align(16))]`
+   table.
+2. `x86-interrupt` calling convention (`extern "x86-interrupt"`, an unstable feature).
+   A handler is not called — it is *jumped to* by hardware, and it must return with
+   `iretq`, not `ret`. The hardware has already pushed an `InterruptStackFrame`
+   (instruction pointer, code segment, flags, stack pointer, stack segment), and some
+   exceptions push an error code on top, changing the handler's signature. This is why
+   the convention must exist at all: the normal C ABI gets both the return instruction
+   and the stack layout wrong.
+3. A breakpoint handler (vector 3) that prints and returns, plus `int3` in `_start` to
+   fire it deliberately — the first exception we *want*.
+4. A `#[test_case]` that executes `int3` and passes if execution continues, which is
+   exactly the kind of test the serial port and `exit_qemu` were built for.
 
-**Rust concepts about to appear.** `core::arch::asm!` and its operand syntax;
-`#[repr(u32)]` on an enum, and why the discriminant type must be pinned when the value
-crosses into hardware; the never type `!` on a diverging function; and, once serial
-exists, a `Testable` trait with a blanket `impl<T: Fn()> Testable for T` so every test
-prints its own name via `core::any::type_name`.
+**Rust concepts about to appear.** `extern "x86-interrupt"` and why a calling convention
+is a language feature; `#[repr(C, align(N))]` and hardware-dictated layout; function
+pointers as struct fields; `lazy_static` or a `static mut`-free way to build a table that
+must live at a fixed address for the lifetime of the kernel, and why `spin::Once` /
+`OnceCell` is the honest answer in a kernel with no heap.
