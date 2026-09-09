@@ -152,21 +152,21 @@ the blog and the compiler disagree, the compiler wins.
 
 ## 5. Where we are right now
 
-Steps 0–3 are done (see `NOTES.md` for the full story):
+Steps 0-11 are done (see `NOTES.md` for the full story, and its `Current state`
+section for the authoritative snapshot):
 
-- Project created, nightly pinned, `panic = "abort"` set for both profiles.
-- `src/main.rs` is a `#![no_std] #![no_main]` freestanding binary with a
-  `#[panic_handler]` and our own `#[unsafe(no_mangle)] pub extern "C" fn _start() -> !`.
-- Custom bare-metal target `x86_64-baddcafe_os.json` (`"os": "none"`, `rust-lld`,
-  no red zone, no SIMD) plus `.cargo/config.toml` with `build-std`.
-- **`cargo build` succeeds.** The output ELF has entry point `0x201120` — our
-  `_start` — and no undefined symbols at all.
+- A freestanding kernel on a custom bare-metal target, booting in QEMU through
+  `bootimage`, with our own VGA text buffer, `println!`, serial output on COM1 and a
+  custom test framework that exits QEMU by itself.
+- A hand-written IDT with handlers for breakpoint and double fault, the latter on its
+  own stack through a hand-written GDT and TSS.
+- The two 8259 PICs remapped above the exception vectors, the timer counting ticks and
+  the keyboard decoding scancodes onto the screen.
+- The crate is a library (`src/lib.rs`) plus a thin binary (`src/main.rs`), so
+  integration tests under `tests/` can be whole kernels of their own.
 
-**Next step:** produce a bootable disk image (`bootloader` crate + `cargo bootimage`)
-and boot it in QEMU. The screen will stay black until we write to the VGA buffer.
-
-Nothing has been committed to git yet — the repo is on branch `master` with zero
-commits.
+**Next step:** paging and virtual memory — walking the page tables the bootloader left
+us, then building our own mapping and a page-fault handler.
 
 ## 6. Roadmap
 
@@ -179,8 +179,8 @@ Rough phil-opp order. Tick items off as `NOTES.md` records them.
 - [x] `println!` macro of our own
 - [x] Testing framework (custom test runner, QEMU exit codes, serial output)
 - [x] CPU exceptions and the IDT (Interrupt Descriptor Table)
-- [ ] Double faults and the IST (Interrupt Stack Table)
-- [ ] Hardware interrupts — PIC, timer, keyboard
+- [x] Double faults and the IST (Interrupt Stack Table)
+- [x] Hardware interrupts — PIC, timer, keyboard
 - [ ] Paging and virtual memory
 - [ ] Heap allocation
 - [ ] Allocator designs

@@ -1267,6 +1267,280 @@ situation and retry. Aborts (double fault) do not promise anything useful at all
 
 ---
 
+## Step 10 — A stack the double-fault handler can trust (GDT, TSS, IST)
+
+**Goal.** Survive the exception that has no handler. Register a handler for vector 8,
+the double fault, and — the harder half — make sure it can run even when the fault was
+caused by a stack that no longer works.
+
+**Concept.** A **double fault** is not "two faults at once". It is what the CPU raises
+when it fails to *deliver* an exception: a page fault happens, the CPU goes to look up
+vector 14 in the IDT, finds no present entry, and now has a second problem while still
+handling the first. That second problem is vector 8. If the delivery of vector 8 also
+fails, there is no third chance — the CPU gives up and **triple-faults**, which on real
+hardware and in QEMU means an immediate reset. Every silent reboot we have had so far
+was a triple fault.
+
+So a double-fault handler is the kernel's safety net: it converts "the machine
+mysteriously restarted" into a message we can read.
+
+But there is a case where merely registering the handler is not enough. Suppose the
+first fault was a **stack overflow**: the program recursed until `rsp` walked off the
+bottom of the stack onto a guard page, and the write that touched the guard page raised
+a page fault. To call a handler, the CPU must first *push* a five-word interrupt stack
+frame — onto the same broken stack. That push faults too. Now the double-fault handler
+must be invoked, and the CPU tries to push *its* frame onto the same broken stack, and
+fails again. Triple fault. The handler is never entered.
+
+The fix is not software. x86-64 provides the **IST** (Interrupt Stack Table): seven
+addresses of known-good stacks, published in a structure called the **TSS** (Task State
+Segment). An IDT entry has a 3-bit field naming one of them. If that field is non-zero,
+the CPU switches `rsp` to that stack *before pushing anything*, unconditionally,
+whatever the old stack pointer was. It cannot fail on a broken stack, because it does
+not use the broken stack.
+
+The TSS is a leftover from 32-bit hardware task switching, a feature 64-bit mode
+dropped. What remains of it is a table of stack pointers: three for privilege-level
+changes (`rsp0`-`rsp2`, unused so far, since we never leave ring 0) and seven for the
+IST. And the TSS can only be pointed at through a descriptor in the **GDT** (Global
+Descriptor Table) — the table that in 32-bit days described memory segments and today
+mostly exists so that `cs` has something to point at. The bootloader set up a GDT for
+its own use; we cannot extend a table we do not own, so we build our own.
+
+That is the chain, and it explains why so much machinery appears for one handler:
+
+```
+IDT entry (vector 8)  --IST index-->  TSS.interrupt_stack_table[0]  --> our stack
+        ^                                     ^
+        | loaded by lidt                      | reachable only via a GDT descriptor,
+        |                                     | selected by ltr
+```
+
+**What we did.**
+
+*First, a library.* A stack-overflow test can only pass by *not* returning: the double
+fault handler must end the QEMU session itself. That cannot share a kernel with other
+tests, so it needs a kernel of its own — and a second binary can only reuse our code if
+that code lives in a library. `src/main.rs` was split:
+
+- `src/lib.rs` — a `#![no_std]` library holding the modules, `init()`, `hlt_loop()`,
+  `QemuExitCode`, `exit_qemu`, `Testable`, `test_runner`, `test_panic_handler`, and
+  (under `#[cfg(test)]`) its own `_start` and panic handler, so `cargo test` can run
+  unit tests against the library itself.
+- `src/main.rs` — now a thin binary: `_start` calls `baddcafe_os::init()`, clears the
+  screen, prints the banner, then parks in `hlt_loop()`.
+- `tests/stack_overflow.rs` — an integration test that is a whole separate kernel, with
+  `harness = false` in `Cargo.toml` because it is one test, not a list of them.
+
+*Then the tables.* `src/gdt.rs`:
+
+- `Tss`, `#[repr(C, packed(4))]`, 104 bytes, field order dictated by the manual.
+- A 20 KiB stack for the handler. It is a `static`, because there is no allocator and
+  no heap; a plain immutable `static` could be placed in a read-only section, and the
+  CPU is going to *write* to this memory, so it is wrapped in `UnsafeCell` with a
+  hand-written `unsafe impl Sync`.
+- `Gdt` — eight `u64` slots, index 0 always the null descriptor. `add_code_segment`
+  pushes a 64-bit ring-0 code descriptor; `add_tss` pushes a **16-byte** system
+  descriptor, twice the size of a normal one, because a 64-bit base address does not
+  fit in a layout designed when addresses were 32 bits.
+- `init()` loads the table with `lgdt`, reloads `cs` and loads the task register.
+
+Reloading `cs` deserves a note: `mov cs, ax` does not exist. The only way to change the
+code segment is to jump through it, so we push the new selector and a return address
+and execute `retfq` — a far return to the very next instruction, which happens to
+reload `cs` on the way.
+
+*Then the IDT.* `set_handler` now returns `&mut Entry`, and `Entry::set_stack_index`
+writes the low three bits of the options word. Vector 8 needs a second handler shape,
+`extern "x86-interrupt" fn(InterruptStackFrame, u64) -> !`: it takes an error code
+(always zero for a double fault) and never returns, because the CPU does not record
+enough state to resume the faulting instruction.
+
+**What happened.** `cargo test` now builds three kernels and boots each one:
+
+```
+Running 4 tests
+baddcafe_os::breakpoint_exception_returns... [ok]
+baddcafe_os::keyboard_decodes_a_shifted_letter... [ok]
+baddcafe_os::timer_interrupt_fires... [ok]
+baddcafe_os::trivial_assertion... [ok]
+...
+stack_overflow::double_fault_survives_stack_overflow... [ok]
+```
+
+The last line is the whole point: a kernel deliberately recursed until its stack ran
+out, and instead of resetting the machine it reached a handler and exited cleanly.
+
+Two errors on the way there are worth keeping:
+
+```
+error[E0133]: use of mutable static is unsafe and requires unsafe block
+   --> src/gdt.rs:116:33
+    |
+116 |         let bottom = &raw const DOUBLE_FAULT_STACK.0 as *const u8 as u64;
+    |                                 ^^^^^^^^^^^^^^^^^^ use of mutable static
+```
+
+Taking `&raw const SOME_STATIC` is allowed without `unsafe`, but reaching *into* a
+mutable static for a field is not. That error is what pushed us to `UnsafeCell`, which
+is the better answer anyway: `static mut` is on its way out of the language, and
+`UnsafeCell` states the same thing precisely — shared, yet mutable, and we take
+responsibility for the synchronisation.
+
+```
+error[E0658]: the extern "x86-interrupt" ABI is experimental and subject to change
+```
+
+An integration test is its own crate, so `#![feature(abi_x86_interrupt)]` has to be
+declared again at the top of `tests/stack_overflow.rs`. Crate attributes do not travel
+with a `use`.
+
+**Why.** The `x86-interrupt` ABI matters here more than usual. A normal function may
+clobber the caller-saved registers; an interrupt handler must leave *every* register
+exactly as it found it, because the interrupted code did not agree to be called. It
+also has to return with `iretq` rather than `ret`, since the CPU pushed a five-word
+frame instead of a plain return address. That is what the ABI generates for us, and it
+is why handlers cannot be ordinary `extern "C"` functions.
+
+**Rust concepts touched.**
+
+- Splitting a crate into a library plus a binary, and what changes: the binary now says
+  `baddcafe_os::…`, and `#[macro_export]` macros are imported from the crate root.
+- `UnsafeCell` and `unsafe impl Sync` — the two halves of "I promise this shared,
+  mutable memory is safe", which the compiler cannot verify and we must.
+- `&raw const` as the modern way to take an address without ever creating a reference.
+- Returning `&mut self.entries[i]` from a setter to allow `set_handler(..).set_stack_index(..)`.
+- The never type `!` as a return type expressing "this function does not come back".
+- `#[repr(C, packed(4))]` — layout dictated by hardware, not by the compiler.
+
+---
+
+## Step 11 — The world interrupts us: PIC, timer, keyboard
+
+**Goal.** Stop asking for exceptions and start receiving events. Wire up the interrupt
+controller, take the timer tick, and turn keypresses into characters on the screen.
+
+**Concept.** Everything the CPU has done for us so far was **synchronous**: `int3` was
+an instruction we executed, a page fault is caused by a memory access we made. A
+keypress is different — it happens because a human moved a finger, at a moment
+unrelated to any instruction. The hardware needs a way to say "now", and the CPU needs
+a way to be told without being asked.
+
+That path is a wire. Devices raise an IRQ line; a chip called the **PIC** (Programmable
+Interrupt Controller, the Intel 8259) collects those lines, decides which one wins, and
+signals the CPU with a vector number. The CPU finishes the current instruction, then
+jumps through the IDT exactly as it does for an exception. From the kernel's side an
+interrupt and an exception look identical; only the cause differs.
+
+A PC has two 8259s, because one chip has eight inputs and eight was not enough by 1983.
+The second is *chained* into line 2 of the first, giving 15 usable IRQs:
+
+```
+                     ____________                          ____________
+ real time clock --> |          |   timer      ---------> |          |
+ ACPI -------------> |          |   keyboard   ---------> |          |      _____
+ available --------> | slave    |_____________            | master   |     |     |
+ available --------> | 8259A    |             |           | 8259A    |---> | CPU |
+ mouse ------------> |          |             |---------> |          |     |_____|
+ co-processor -----> |          |                         |          |
+ primary ATA ------> |          |                         |          |
+ secondary ATA ----> |__________|                         |__________|
+```
+
+Two things must be fixed before enabling any of this.
+
+**The vectors collide.** By default the master PIC delivers IRQ0-7 as vectors 8-15. On
+a 64-bit CPU, vector 8 is the double fault and 13 is the general protection fault. Left
+alone, the first timer tick would arrive at our double-fault handler. So the chips must
+be **remapped**, and 32 is the first vector the CPU architecture leaves free: exceptions
+own 0-31. Ours land at 32 (timer) and 33 (keyboard).
+
+**Locks become deadlocks.** `print!` takes the `WRITER` spinlock. If an interrupt fires
+while the main code holds that lock, and the handler prints, the handler spins forever
+waiting for a lock that will only be released by the code it interrupted — which will
+never run again. This was written down as a hazard in Step 9 and became real the moment
+interrupts were enabled. The fix is to disable interrupts for the duration of the lock:
+`without_interrupts` reads the flags register, clears IF with `cli`, runs the closure,
+and restores IF only if it had been set.
+
+**What we did.**
+
+`src/pic.rs` — initialisation is a fixed four-word conversation with each chip, sent
+through its data port: ICW1 says "a new initialisation begins", ICW2 carries the vector
+offset, ICW3 describes the chaining, ICW4 asks for 8086 mode. Each write is followed by
+`io_wait()`, a read from unused port 0x80 — the 8259 is much older than the bus and
+needs the delay to latch the previous byte. Then a mask byte per chip: everything
+masked except IRQ0, IRQ1 and IRQ2 (the cascade line, which must stay open or the second
+chip is unreachable). `end_of_interrupt` acknowledges a vector; without it the
+controller keeps the line busy and never sends another event — a keyboard that answers
+exactly one keypress.
+
+`src/idt.rs` — two more handlers plus the interrupt-flag helpers:
+
+- `timer_handler` bumps an `AtomicU64` and sends EOI. It prints nothing; a tick is 55
+  times a second and the screen would be useless.
+- `keyboard_handler` reads port 0x60, decodes it, prints the character, sends EOI.
+- `enable`, `disable`, `are_enabled`, `without_interrupts`.
+
+`src/keyboard.rs` — the controller hands us a **scancode**, not a character. It is a
+position on the keyboard, not a letter: the same physical key sends the same code on a
+Greek or a Dvorak layout. Set 1 encodes a press as a *make code* and the matching
+release as the same code with bit 7 set, which is why two 0x40-entry tables cover the
+whole main block. Shift and caps lock are state we keep ourselves, because the hardware
+does not: shift is "is it currently held", caps lock toggles on press and inverts the
+case of letters only. Codes prefixed with 0xE0 (arrows, right control, the keypad) are
+recognised and dropped for now.
+
+`src/vga_buffer.rs` — typing needs two things printing did not: backspace (0x08 moves
+the column back and blanks the cell) and a cursor. The blinking cursor is not a
+character in the buffer; it is a position stored in two CRT controller registers, so
+`update_cursor` writes the cell index to ports 0x3D4/0x3D5 after every change.
+
+`src/lib.rs` — `init()` now does the whole sequence in the one order that works: serial,
+GDT, IDT, PIC, `sti`. GDT before IDT, because each IDT entry stores the code-segment
+selector that is current when it is written. `sti` last, because an interrupt arriving
+before the IDT is loaded is a triple fault.
+
+And `loop {}` became `hlt_loop()`. A bare `loop {}` keeps the CPU at 100% doing nothing;
+`hlt` stops the core until the next interrupt arrives. With interrupts on it wakes for
+every tick and every keypress, so it costs nothing and idles honestly.
+
+**What happened.** The kernel boots, prints the banner, and typing on the QEMU window
+puts characters on the screen. Verified without a human at the keyboard by driving
+QEMU's monitor: `sendkey h`, `sendkey i`, `sendkey spc`, `sendkey shift-r`, … then
+reading the VGA buffer straight out of physical memory with `xp /160xb 0xb80e0`:
+
+```
+row 22: 'Timer and keyboard interrupts are on. Type:'
+row 23: 'hi Rust'
+row 24: '12'
+```
+
+Row 23 is shift working (capital R), row 24 is `1`, `2`, `3` followed by a backspace.
+`cargo test` reports five green tests across three kernels, one of which waits for the
+timer tick counter to move and would hang forever if the PIC were misconfigured.
+
+**Why.** The remapping is the interesting part of the design. Nothing in the 8259 knows
+what a double fault is; it simply sends "vector = offset + line". The collision exists
+because IBM chose the offsets in 1981 for a CPU whose exception range stopped at 5, and
+Intel later grew the exception range into that space. Backward compatibility means the
+default is still wrong, and every x86 kernel written since has had to fix it in the
+same eight port writes.
+
+**Rust concepts touched.**
+
+- `AtomicU64` with `Ordering::Relaxed` — shared mutable state that needs no lock, and
+  therefore cannot deadlock inside a handler.
+- Closures as arguments: `without_interrupts<F: FnOnce() -> R, R>(f: F) -> R`, generic
+  over both the closure and its return type. `FnOnce` because calling it once is all we
+  need, and it is the least demanding bound the caller can satisfy.
+- `const` lookup tables of `char`, indexed by a hardware code — data instead of a
+  hundred-arm `match`.
+- Method calls on a `Mutex`-guarded struct inside an interrupt handler, and why that is
+  only safe because every other user of the same lock disables interrupts first.
+
+---
+
 ## Reference — files, commands, and how to read the machine
 
 This section is not a journal entry. It is the lookup table: every configuration file
@@ -1314,6 +1588,10 @@ test-args = [
 ]
 test-success-exit-code = 33
 
+[[test]]
+name = "stack_overflow"
+harness = false
+
 [dependencies]
 bootloader = "0.9.35"
 spin = "0.12.3"
@@ -1335,6 +1613,10 @@ panic = "abort"
 - `bootloader = "0.9.35"` — a dependency our source never `use`s. It is here so that
   `bootimage`, an external tool, can read the manifest and learn which bootloader
   version to build. Cargo warns `unused dependency`; the warning is wrong for our case.
+- `[[test]] name = "stack_overflow", harness = false` — an integration test that is a
+  whole kernel of its own. `harness = false` means cargo does not look for `#[test]`
+  functions in it and simply runs its `_start`; the test either exits QEMU itself or
+  fails. It exists because a stack-overflow test cannot return to a test runner.
 - `spin = "0.12.3"` — a spinlock. There is no operating system to put a waiting thread
   to sleep, so a contended lock loops instead. Used for the global `WRITER` and `SERIAL`.
 - `[package.metadata.bootimage]` — cargo ignores this table; `bootimage` reads it.
@@ -1654,76 +1936,77 @@ evidence that all three rungs were climbed before control reached `_start`.
 ## Current state
 
 - Branch `master`. Committed: `75d458e` (steps 0-3), `d40df33` (step 4), `3fa414d`
-  (steps 5-6), `ae7a1a8` (step 7), `da2a262` (step 8). Step 9 is committed alongside
-  this entry.
+  (steps 5-6), `ae7a1a8` (step 7), `da2a262` (step 8), `fd8bae1` (step 9). Steps 10 and
+  11 are committed alongside this entry.
 - Toolchain: nightly `1.100.0-nightly (a69a63265 2026-09-03)`, pinned by
   `rust-toolchain.toml`, with `rust-src` and `llvm-tools-preview`.
 - Edition 2024. `panic = "abort"` on both profiles, `panic-abort-tests = true`.
   Unstable features in use: `custom_test_frameworks`, `abi_x86_interrupt`.
 - Dependencies: `bootloader = "0.9.35"` (read by `bootimage`, never linked) and
-  `spin = "0.12.3"` (`Mutex` behind `WRITER`/`SERIAL`, `Once` behind `IDT`).
-- `src/main.rs`: `_start` initialises the UART, loads the IDT, clears the screen, then
-  runs `test_main()` or `banner()`. Two panic handlers split on `cfg(test)`.
-  `QemuExitCode`, `exit_qemu`, `Testable` + blanket impl, `test_runner`, two test cases.
-- `src/idt.rs`: hand-written IDT — 16-byte `Entry`, `#[repr(C, align(16))] Idt`,
-  `InterruptStackFrame` with a hex `Debug`, `lidt` via `DescriptorTablePointer`, the
-  code-segment selector read out of `cs`, a global `spin::Once<Idt>`, and a breakpoint
-  handler on vector 3.
-- `src/port.rs`: `outb`, `outl`, `inb`. `src/serial.rs`: the 16550 UART on COM1.
-  `src/vga_buffer.rs`: unchanged since Step 6.
-- **`cargo run` boots, prints, takes a breakpoint exception and comes back.
-  `cargo test` runs 2 tests on serial and exits 0.** Both verified; the failure path
-  (broken assertion → `[failed]`, panic message, status 35) verified in Step 8.
+  `spin = "0.12.3"` (`Mutex` behind `WRITER`/`SERIAL`/`KEYBOARD`, `Once` behind the
+  `IDT`, the `GDT` and the `TSS`).
+- The crate is now a library plus a binary:
+  - `src/lib.rs` — modules, `init()` (serial → GDT → IDT → PIC → `sti`), `hlt_loop()`,
+    `QemuExitCode`, `exit_qemu`, `Testable`, `test_runner`, `test_panic_handler`, and a
+    `#[cfg(test)]` `_start`/panic handler for the library's own test kernel. Four test
+    cases live here.
+  - `src/main.rs` — `_start`, the banner, the two panic handlers split on `cfg(test)`.
+  - `tests/stack_overflow.rs` — a separate kernel with `harness = false`.
+- `src/gdt.rs`: `Tss` (`repr(C, packed(4))`), a 20 KiB `UnsafeCell` stack for the
+  double-fault handler, an eight-slot `Gdt` with a null descriptor, a ring-0 code
+  segment and a 16-byte TSS descriptor, `lgdt`, a `retfq` trampoline to reload `cs`,
+  and `ltr`.
+- `src/idt.rs`: the hand-written IDT, now with `set_handler` returning `&mut Entry`,
+  `Entry::set_stack_index`, a diverging handler type with an error code, handlers for
+  breakpoint (3), double fault (8, on IST 0), timer (32) and keyboard (33), a `TICKS`
+  counter, and `enable`/`disable`/`are_enabled`/`without_interrupts`.
+- `src/pic.rs`: the two 8259s remapped to 32-47, all lines masked except timer,
+  keyboard and the cascade, plus `end_of_interrupt` and `io_wait`.
+- `src/keyboard.rs`: scancode set 1 decoded through two 0x40-entry `char` tables, with
+  shift, caps lock and 0xE0-prefixed keys handled; a `Mutex<Keyboard>` global.
+- `src/vga_buffer.rs`: as before, plus backspace, hardware cursor updates through ports
+  0x3D4/0x3D5, and `_print` wrapped in `without_interrupts`. `src/serial.rs` likewise.
+- **`cargo run` boots and the keyboard types on the screen. `cargo test` runs five
+  tests across three kernels and exits 0.** Both verified; the keyboard was verified
+  without a human by driving QEMU's monitor with `sendkey` and reading `0xb8000` back
+  with `xp`.
 - Warnings we are knowingly carrying: cargo's kebab-case binary-name suggestion, the
-  future-incompatibility report about nightly's own `core` sources, `unused dependency`
-  for `bootloader`, and an explicit `#[allow(dead_code)]` on `outl`.
+  future-incompatibility report about nightly's own `core` sources, and
+  `unused dependency` for `bootloader`.
 - Known hazards:
-  - `_print` and `serial::_print` hold their lock across `unwrap()`. The breakpoint
-    handler prints, so this is no longer theoretical: an exception raised while the main
-    code holds the `WRITER` lock deadlocks the machine. It cannot happen today because
-    the only exception we take is one we asked for, at a point where no lock is held. It
-    becomes real the moment hardware interrupts arrive, and the fix is to disable
-    interrupts around the lock.
-  - Only vector 3 is present. Every other exception — including a page fault or a
-    general protection fault caused by our own bug — still triple-faults and resets the
-    machine. That is the next step.
-  - Tests live in `src/main.rs` only; there is no library target, so `tests/` integration
-    tests are not possible yet.
+  - Only vectors 3, 8, 32 and 33 are present. Every other exception — a page fault or a
+    general protection fault from our own bug — still reaches the double-fault handler
+    (which now panics with a readable message instead of resetting the machine), but we
+    learn nothing about the original cause.
+  - The double-fault stack has no guard page. An overflow inside the handler itself
+    would silently corrupt whatever sits below it. Guard pages need paging, which is the
+    next chapter.
+  - `keyboard_handler` prints directly from the interrupt handler. It is short and it
+    cannot deadlock (every `WRITER` user disables interrupts), but the right design is a
+    queue the handler pushes to and normal code drains. That arrives with async/await.
+  - Extended (0xE0) scancodes — arrows, right control, keypad — are decoded and thrown
+    away.
 
 ## Next step
 
-**Double faults, and giving them a stack of their own (GDT, TSS, IST).**
+**Paging and virtual memory.**
 
-A **double fault** (vector 8) is what the CPU raises when it fails to invoke the handler
-for a first exception — most often because that handler is simply not present. It is the
-kernel's safety net: catching it turns a silent reboot into a message. The first half of
-the step is small: register a handler for vector 8 and watch a deliberate page fault
-produce a readable panic instead of a reset.
+Everything we have touched so far has been at a physical address we knew by heart:
+`0xb8000` for the screen, `0x60` for the keyboard. Meanwhile the CPU has been running
+with paging on the whole time — the bootloader had to enable it to enter long mode —
+and every address our code uses is already virtual, translated by four levels of page
+tables before it reaches memory. We have simply been living inside a mapping someone
+else built for us.
 
-The second half is the interesting one, and it is where the x86 gets honest about
-stacks. If the first exception was a **stack overflow**, the stack pointer is already
-past the bottom of the stack, on a guard page. The CPU then tries to *push* the
-interrupt stack frame for the double-fault handler onto that same broken stack, fails
-again, and triple-faults. The handler is never reached. The only fix is hardware:
+The next step is to look at that mapping and then take it over: read `CR3` to find the
+level-4 table, walk it, and translate an address by hand to see the four table lookups
+the hardware does on every single memory access. The obstacle is immediate and
+delicious — the page tables are stored in *physical* memory, and we can only issue
+*virtual* addresses, so reading them requires them to be mapped, which is the problem
+we are trying to solve. The `bootloader` crate offers a way out (a complete map of
+physical memory at a known offset), and the alternatives — identity mapping, recursive
+mapping — are worth understanding before picking one.
 
-- The **TSS** (Task State Segment) is a structure that, in 64-bit mode, exists mostly to
-  hold two arrays of stack pointers. One of them is the **IST** (Interrupt Stack Table),
-  seven addresses of known-good stacks.
-- An IDT entry's options word has a 3-bit **IST index** field. Set it, and the CPU
-  *unconditionally* switches to that stack before pushing anything — no matter what the
-  current stack pointer was.
-- The TSS is reachable only through a descriptor in the **GDT** (Global Descriptor
-  Table), so we must build a GDT of our own — the bootloader's is not ours to extend —
-  and load it with `lgdt`, plus `ltr` to tell the CPU which entry is the TSS.
-
-The pieces: a `static` stack (a plain `[u8; N]` array, since there is no allocator), a
-`Tss` with `#[repr(C, packed)]`, a `Gdt` holding a null entry, a kernel code segment and
-a 16-byte system descriptor for the TSS, `set_handler` gaining an IST index argument,
-and a test that overflows the stack on purpose and passes only if the double-fault
-handler runs.
-
-**Rust concepts about to appear.** `static` arrays as memory with a fixed address, and
-taking their address safely; why a TSS descriptor is 16 bytes while a code descriptor is
-8, and how a `#[repr(C)]` type expresses that; `unsafe` blocks whose invariant is "this
-index is one we registered ourselves"; and the split of the crate into a library plus a
-binary, so that a stack-overflow test can live in its own kernel under `tests/`.
+After that, a page fault handler that prints `CR2` (the address that faulted) turns the
+double-fault safety net into a diagnosis, and a frame allocator plus the ability to map
+a new page is what makes a heap possible.

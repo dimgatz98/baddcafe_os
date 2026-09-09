@@ -2,6 +2,7 @@ use core::fmt::{self, Write};
 
 use spin::Mutex;
 
+use crate::idt::without_interrupts;
 use crate::port::{inb, outb};
 
 const COM1: u16 = 0x3f8;
@@ -70,5 +71,5 @@ macro_rules! serial_println {
 
 #[doc(hidden)]
 pub fn _print(args: fmt::Arguments) {
-    SERIAL.lock().write_fmt(args).unwrap();
+    without_interrupts(|| SERIAL.lock().write_fmt(args).unwrap());
 }

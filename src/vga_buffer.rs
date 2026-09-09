@@ -3,6 +3,9 @@ use core::ptr;
 
 use spin::Mutex;
 
+use crate::idt::without_interrupts;
+use crate::port::outb;
+
 const BUFFER_HEIGHT: usize = 25;
 const BUFFER_WIDTH: usize = 80;
 const BUFFER_ADDR: *mut ScreenChar = 0xb8000 as *mut ScreenChar;
@@ -67,6 +70,7 @@ impl Writer {
     pub fn write_byte(&mut self, byte: u8) {
         match byte {
             b'\n' => self.new_line(),
+            0x08 => self.backspace(),
             byte => {
                 if self.column_position >= BUFFER_WIDTH {
                     self.new_line();
@@ -85,12 +89,13 @@ impl Writer {
                 self.column_position += 1;
             }
         }
+        self.update_cursor();
     }
 
     pub fn write_string(&mut self, s: &str) {
         for byte in s.bytes() {
             match byte {
-                0x20..=0x7e | b'\n' => self.write_byte(byte),
+                0x08 | b'\n' | 0x20..=0x7e => self.write_byte(byte),
                 _ => self.write_byte(0xfe),
             }
         }
@@ -101,6 +106,19 @@ impl Writer {
             self.clear_row(row);
         }
         self.column_position = 0;
+        self.update_cursor();
+    }
+
+    pub fn backspace(&mut self) {
+        if self.column_position == 0 {
+            return;
+        }
+        self.column_position -= 1;
+        let blank = ScreenChar {
+            ascii_character: b' ',
+            color_code: self.color_code,
+        };
+        self.write_cell(BUFFER_HEIGHT - 1, self.column_position, blank);
     }
 
     fn new_line(&mut self) {
@@ -127,6 +145,18 @@ impl Writer {
     /// Volatile: nothing in this program ever reads these cells back, so a normal
     /// store would be legal for the compiler to delete. The video hardware is the
     /// reader, and the compiler cannot see it.
+    /// The blinking cursor is state inside the card, not a cell in the buffer: it is
+    /// drawn wherever these two registers point, whatever we wrote where.
+    fn update_cursor(&self) {
+        let position = ((BUFFER_HEIGHT - 1) * BUFFER_WIDTH + self.column_position) as u16;
+        unsafe {
+            outb(0x3d4, 0x0f);
+            outb(0x3d5, position as u8);
+            outb(0x3d4, 0x0e);
+            outb(0x3d5, (position >> 8) as u8);
+        }
+    }
+
     fn write_cell(&mut self, row: usize, col: usize, character: ScreenChar) {
         unsafe { ptr::write_volatile(BUFFER_ADDR.add(row * BUFFER_WIDTH + col), character) }
     }
@@ -159,5 +189,5 @@ macro_rules! println {
 
 #[doc(hidden)]
 pub fn _print(args: fmt::Arguments) {
-    WRITER.lock().write_fmt(args).unwrap();
+    without_interrupts(|| WRITER.lock().write_fmt(args).unwrap());
 }
