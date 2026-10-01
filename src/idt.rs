@@ -10,6 +10,7 @@ use crate::{keyboard, pic, print, println, serial_println};
 
 const BREAKPOINT: u8 = 3;
 const DOUBLE_FAULT: u8 = 8;
+const PAGE_FAULT: u8 = 14;
 
 pub const TIMER: u8 = pic::PIC1_OFFSET;
 pub const KEYBOARD: u8 = pic::PIC1_OFFSET + 1;
@@ -18,6 +19,7 @@ pub const KEYBOARD: u8 = pic::PIC1_OFFSET + 1;
 const INTERRUPT_GATE: u16 = 0x8e00;
 
 pub type HandlerFunc = extern "x86-interrupt" fn(InterruptStackFrame);
+pub type HandlerFuncWithErrorCode = extern "x86-interrupt" fn(InterruptStackFrame, u64);
 pub type DivergingHandlerFuncWithErrorCode =
     extern "x86-interrupt" fn(InterruptStackFrame, u64) -> !;
 
@@ -41,6 +43,38 @@ impl fmt::Debug for InterruptStackFrame {
             .field("stack_pointer", &format_args!("{:#x}", self.stack_pointer))
             .field("stack_segment", &format_args!("{:#x}", self.stack_segment))
             .finish()
+    }
+}
+
+/// Why the access failed, as the CPU pushes it for vector 14.
+#[derive(Clone, Copy)]
+struct PageFaultErrorCode(u64);
+
+impl PageFaultErrorCode {
+    const FLAGS: [(u64, &'static str); 5] = [
+        (1 << 0, "PROTECTION_VIOLATION"),
+        (1 << 1, "CAUSED_BY_WRITE"),
+        (1 << 2, "USER_MODE"),
+        (1 << 3, "MALFORMED_TABLE"),
+        (1 << 4, "INSTRUCTION_FETCH"),
+    ];
+}
+
+impl fmt::Debug for PageFaultErrorCode {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{:#07b}", self.0)?;
+        let mut separator = " (";
+        for (bit, name) in Self::FLAGS {
+            if self.0 & bit != 0 {
+                f.write_str(separator)?;
+                f.write_str(name)?;
+                separator = " | ";
+            }
+        }
+        if separator != " (" {
+            f.write_str(")")?;
+        }
+        Ok(())
     }
 }
 
@@ -99,9 +133,25 @@ impl Idt {
         }
     }
 
+    /// The three setters differ only in the handler signature they accept; a function
+    /// type is part of the type in Rust, so one generic entry point is not possible
+    /// without erasing exactly the check that makes these safe.
+    fn set(&mut self, vector: u8, address: u64) -> &mut Entry {
+        let entry = &mut self.entries[vector as usize];
+        *entry = Entry::new(address);
+        entry
+    }
+
     pub fn set_handler(&mut self, vector: u8, handler: HandlerFunc) -> &mut Entry {
-        self.entries[vector as usize] = Entry::new(handler as u64);
-        &mut self.entries[vector as usize]
+        self.set(vector, handler as u64)
+    }
+
+    pub fn set_handler_with_error_code(
+        &mut self,
+        vector: u8,
+        handler: HandlerFuncWithErrorCode,
+    ) -> &mut Entry {
+        self.set(vector, handler as u64)
     }
 
     pub fn set_diverging_handler_with_error_code(
@@ -109,8 +159,7 @@ impl Idt {
         vector: u8,
         handler: DivergingHandlerFuncWithErrorCode,
     ) -> &mut Entry {
-        self.entries[vector as usize] = Entry::new(handler as u64);
-        &mut self.entries[vector as usize]
+        self.set(vector, handler as u64)
     }
 
     /// `&'static` because the CPU keeps reading this table long after `load` returns.
@@ -131,6 +180,16 @@ fn code_segment() -> u16 {
         asm!("mov {0:x}, cs", out(reg) segment, options(nomem, nostack, preserves_flags));
     }
     segment
+}
+
+/// The CPU writes the address that faulted into CR2, and overwrites it on the next
+/// page fault, so a handler must read it before it does anything else that can fault.
+pub fn read_cr2() -> u64 {
+    let address: u64;
+    unsafe {
+        asm!("mov {}, cr2", out(reg) address, options(nomem, nostack, preserves_flags));
+    }
+    address
 }
 
 pub fn int3() {
@@ -190,6 +249,7 @@ pub fn init() {
         idt.set_handler(BREAKPOINT, breakpoint_handler);
         idt.set_diverging_handler_with_error_code(DOUBLE_FAULT, double_fault_handler)
             .set_stack_index(gdt::DOUBLE_FAULT_IST_INDEX);
+        idt.set_handler_with_error_code(PAGE_FAULT, page_fault_handler);
         idt.set_handler(TIMER, timer_handler);
         idt.set_handler(KEYBOARD, keyboard_handler);
         idt
@@ -210,6 +270,23 @@ extern "x86-interrupt" fn double_fault_handler(
 ) -> ! {
     serial_println!("EXCEPTION: DOUBLE FAULT\n{:#?}", stack_frame);
     panic!("double fault");
+}
+
+/// Returning is legal for vector 14 — the faulting instruction is restartable, which is
+/// what makes demand paging and copy-on-write possible — but only once the handler has
+/// fixed the mapping. We have nothing to fix yet, so we stop instead of faulting again.
+extern "x86-interrupt" fn page_fault_handler(stack_frame: InterruptStackFrame, error_code: u64) {
+    let address = read_cr2();
+    let error_code = PageFaultErrorCode(error_code);
+    println!(
+        "EXCEPTION: PAGE FAULT\naccessed address: {:#x}\nerror code: {:?}\n{:#?}",
+        address, error_code, stack_frame
+    );
+    serial_println!(
+        "EXCEPTION: PAGE FAULT\naccessed address: {:#x}\nerror code: {:?}\n{:#?}",
+        address, error_code, stack_frame
+    );
+    crate::hlt_loop()
 }
 
 extern "x86-interrupt" fn timer_handler(_stack_frame: InterruptStackFrame) {

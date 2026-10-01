@@ -1541,6 +1541,126 @@ same eight port writes.
 
 ---
 
+## Step 12 — The page fault handler, and what the CPU tells us
+
+**Goal.** Fill vector 14, so that a failed memory access produces the faulting address
+and the reason, instead of being paid for with a double fault.
+
+**Concept.** Until now vector 14 was **missing** from the IDT. A bad memory access
+therefore went: page fault → the CPU looks up entry 14 → `present = 0` → double fault.
+Our double-fault handler printed "double fault" and panicked, which is correct and
+useless: the one piece of information worth having — *which address, and why* — was
+gone by then.
+
+This matters more from here on than it did behind us. The moment we start touching page
+tables, **every** mistake will arrive as a page fault. Without this handler we would be
+staring at "double fault" and guessing.
+
+The CPU hands us three things:
+
+1. **`CR2`** — a control register the CPU fills with the address that failed. It is the
+   only place that information exists, and the next page fault overwrites it. So a
+   handler must read it before doing anything else that could itself fault.
+2. **An error code**, pushed on the stack, which is a bitfield:
+
+   | bit | 0 means | 1 means |
+   |---|---|---|
+   | 0 | nothing is mapped there | it is mapped, but the access was not allowed |
+   | 1 | it was a read | it was a write |
+   | 2 | ring 0 | ring 3 |
+   | 3 | — | a reserved bit in a page table entry was not zero |
+   | 4 | — | the CPU was trying to *execute* there |
+
+3. **The interrupt stack frame**, whose `instruction_pointer` is the instruction that
+   faulted — not the one after it, as with `int3`.
+
+The deep point is in the handler's signature. A page-fault handler **may return**: the
+faulting instruction is restartable. That is not a quirk, it is the entire mechanism —
+a real kernel fixes the mapping first (fetches the page from disk, hands a fresh frame
+to a `malloc` that just touched it, resolves a copy-on-write) and *then* returns, and
+the instruction succeeds. A page fault is not an error; it is how virtual memory is
+built. We have nothing to fix yet, so ours stops the machine instead of letting the
+same instruction fault forever.
+
+**What we did.** `src/idt.rs`:
+
+- `const PAGE_FAULT: u8 = 14;` and a third handler type,
+  `pub type HandlerFuncWithErrorCode = extern "x86-interrupt" fn(InterruptStackFrame, u64)`
+  — the diverging one we already had, minus the `-> !`.
+- The three setters had become near-copies, so the body moved into one private
+  `fn set(&mut self, vector: u8, address: u64) -> &mut Entry` and the three public ones
+  are now one line each. They cannot be collapsed further: a function's signature is
+  part of its type in Rust, so a single generic entry point would have to erase exactly
+  the check that makes these calls safe.
+- `pub fn read_cr2() -> u64`, one `mov {}, cr2`.
+- A private `PageFaultErrorCode(u64)` newtype whose only job is a `Debug` impl that
+  prints the raw bits *and* the names of the bits that are set.
+- `page_fault_handler`, which prints address, error code and stack frame to both the
+  screen and the serial port, then calls `hlt_loop()`.
+
+Two new integration tests, each a whole kernel with its own IDT (the handler ends the
+QEMU session, so it cannot share one with other tests):
+
+- `tests/page_fault.rs` — writes to `0xdeadbeaf`, and the handler asserts that `CR2`
+  holds exactly that address and that the error code is `0b10`: not present, caused by
+  a write.
+- `tests/page_fault_protection.rs` — writes to `_start`, i.e. to our own code, and
+  asserts the error code is `0b11`: mapped, and a write is what was refused.
+
+**What happened.** The first attempt did not reach the hardware at all:
+
+```
+page_fault::write_to_unmapped_page... [failed]
+panicked at tests/page_fault.rs:29:14:
+misaligned pointer dereference: address must be a multiple of 0x8 but is 0xdeadbeaf
+```
+
+A debug build inserts an alignment check *before* the access, and `0xdeadbeaf` is not a
+multiple of 8, so the dereference of a `*mut u64` panicked before the CPU ever saw it.
+Writing through a `*mut u8` — alignment 1 — fixed it. Worth remembering: a debug build
+can intercept undefined behaviour before the machine does, which is helpful everywhere
+except when the machine's reaction is the thing you are testing.
+
+With that fixed, all five tests pass, and the handler on a live kernel prints:
+
+```
+EXCEPTION: PAGE FAULT
+accessed address: 0xdeadbeaf
+error code: 0b00010 (CAUSED_BY_WRITE)
+InterruptStackFrame {
+    instruction_pointer: 0x2048e2,
+    code_segment: 0x8,
+    cpu_flags: 0x202,
+    stack_pointer: 0x10000201e90,
+    stack_segment: 0x0,
+}
+```
+
+**Why.** The protection test is the more interesting of the two, because it passes
+*only* because someone else enforced something we never asked for. Writing to our own
+`.text` produces bit 0 = 1 (the page is there) and bit 1 = 1 (a write was refused),
+which proves the bootloader mapped our code read-only and that the hardware, not the
+compiler, is what stops the write. Permissions live in the page table entries. The
+`const`/`mut` distinction in Rust is a compile-time story about aliasing; this is a
+different mechanism entirely, enforced on every single access, and it is the one that
+still applies to code that lies.
+
+**Rust concepts touched.**
+
+- Raw pointer dereference as the rawest form of `unsafe`: `*(0xdeadbeaf as *mut u8) = 42`
+  compiles because the compiler has no way whatsoever to know whether that address means
+  anything. Nothing here is checkable; the `unsafe` is a pure assertion by us.
+- Debug-build UB checks (`misaligned pointer dereference`) and when they get in the way.
+- A newtype (`PageFaultErrorCode`) with a hand-written `Debug` instead of a
+  bitflags-style dependency: `write!` for the raw value, then a running separator over a
+  `const` array of (bit, name) pairs.
+- Why three setters are not reducible to one generic: function types, and the fact that
+  erasing them is exactly what we do *not* want.
+- A non-diverging handler whose body ends in a `-> !` call — `hlt_loop()` coerces to
+  `()`, so the signature stays honest about what the hardware allows.
+
+---
+
 ## Reference — files, commands, and how to read the machine
 
 This section is not a journal entry. It is the lookup table: every configuration file
@@ -1592,6 +1712,14 @@ test-success-exit-code = 33
 name = "stack_overflow"
 harness = false
 
+[[test]]
+name = "page_fault"
+harness = false
+
+[[test]]
+name = "page_fault_protection"
+harness = false
+
 [dependencies]
 bootloader = "0.9.35"
 spin = "0.12.3"
@@ -1613,10 +1741,10 @@ panic = "abort"
 - `bootloader = "0.9.35"` — a dependency our source never `use`s. It is here so that
   `bootimage`, an external tool, can read the manifest and learn which bootloader
   version to build. Cargo warns `unused dependency`; the warning is wrong for our case.
-- `[[test]] name = "stack_overflow", harness = false` — an integration test that is a
-  whole kernel of its own. `harness = false` means cargo does not look for `#[test]`
+- The `[[test]]` tables — each is an integration test that is a whole kernel of its own. `harness = false` means cargo does not look for `#[test]`
   functions in it and simply runs its `_start`; the test either exits QEMU itself or
-  fails. It exists because a stack-overflow test cannot return to a test runner.
+  fails. They exist because a test whose handler ends the session cannot return to a
+  shared test runner.
 - `spin = "0.12.3"` — a spinlock. There is no operating system to put a waiting thread
   to sleep, so a contended lock loops instead. Used for the global `WRITER` and `SERIAL`.
 - `[package.metadata.bootimage]` — cargo ignores this table; `bootimage` reads it.
@@ -1936,77 +2064,91 @@ evidence that all three rungs were climbed before control reached `_start`.
 ## Current state
 
 - Branch `master`. Committed: `75d458e` (steps 0-3), `d40df33` (step 4), `3fa414d`
-  (steps 5-6), `ae7a1a8` (step 7), `da2a262` (step 8), `fd8bae1` (step 9). Steps 10 and
-  11 are committed alongside this entry.
+  (steps 5-6), `ae7a1a8` (step 7), `da2a262` (step 8), `fd8bae1` (step 9), `d17b0df`
+  (steps 10-11). Step 12 is committed alongside this entry.
 - Toolchain: nightly `1.100.0-nightly (a69a63265 2026-09-03)`, pinned by
   `rust-toolchain.toml`, with `rust-src` and `llvm-tools-preview`.
 - Edition 2024. `panic = "abort"` on both profiles, `panic-abort-tests = true`.
   Unstable features in use: `custom_test_frameworks`, `abi_x86_interrupt`.
 - Dependencies: `bootloader = "0.9.35"` (read by `bootimage`, never linked) and
   `spin = "0.12.3"` (`Mutex` behind `WRITER`/`SERIAL`/`KEYBOARD`, `Once` behind the
-  `IDT`, the `GDT` and the `TSS`).
-- The crate is now a library plus a binary:
+  `IDT`, the `GDT`, the `TSS` and each test kernel's own IDT).
+- The crate is a library plus a binary:
   - `src/lib.rs` — modules, `init()` (serial → GDT → IDT → PIC → `sti`), `hlt_loop()`,
     `QemuExitCode`, `exit_qemu`, `Testable`, `test_runner`, `test_panic_handler`, and a
     `#[cfg(test)]` `_start`/panic handler for the library's own test kernel. Four test
     cases live here.
   - `src/main.rs` — `_start`, the banner, the two panic handlers split on `cfg(test)`.
-  - `tests/stack_overflow.rs` — a separate kernel with `harness = false`.
+  - `tests/stack_overflow.rs`, `tests/page_fault.rs`,
+    `tests/page_fault_protection.rs` — three separate kernels, `harness = false`.
 - `src/gdt.rs`: `Tss` (`repr(C, packed(4))`), a 20 KiB `UnsafeCell` stack for the
   double-fault handler, an eight-slot `Gdt` with a null descriptor, a ring-0 code
   segment and a 16-byte TSS descriptor, `lgdt`, a `retfq` trampoline to reload `cs`,
   and `ltr`.
-- `src/idt.rs`: the hand-written IDT, now with `set_handler` returning `&mut Entry`,
-  `Entry::set_stack_index`, a diverging handler type with an error code, handlers for
-  breakpoint (3), double fault (8, on IST 0), timer (32) and keyboard (33), a `TICKS`
-  counter, and `enable`/`disable`/`are_enabled`/`without_interrupts`.
+- `src/idt.rs`: the hand-written IDT. One private `set` behind three public setters
+  (plain, with error code, diverging with error code), `Entry::set_stack_index`,
+  handlers for breakpoint (3), double fault (8, on IST 0), page fault (14), timer (32)
+  and keyboard (33), the `PageFaultErrorCode` newtype, `read_cr2`, a `TICKS` counter,
+  and `enable`/`disable`/`are_enabled`/`without_interrupts`.
 - `src/pic.rs`: the two 8259s remapped to 32-47, all lines masked except timer,
   keyboard and the cascade, plus `end_of_interrupt` and `io_wait`.
 - `src/keyboard.rs`: scancode set 1 decoded through two 0x40-entry `char` tables, with
   shift, caps lock and 0xE0-prefixed keys handled; a `Mutex<Keyboard>` global.
-- `src/vga_buffer.rs`: as before, plus backspace, hardware cursor updates through ports
-  0x3D4/0x3D5, and `_print` wrapped in `without_interrupts`. `src/serial.rs` likewise.
-- **`cargo run` boots and the keyboard types on the screen. `cargo test` runs five
-  tests across three kernels and exits 0.** Both verified; the keyboard was verified
-  without a human by driving QEMU's monitor with `sendkey` and reading `0xb8000` back
-  with `xp`.
+- `src/vga_buffer.rs`: the `Writer`, plus backspace, hardware cursor updates through
+  ports 0x3D4/0x3D5, and `_print` wrapped in `without_interrupts`. `src/serial.rs`
+  likewise.
+- **`cargo run` boots and the keyboard types on the screen. `cargo test` runs seven
+  tests across four kernels and exits 0.** Verified: four library tests, plus
+  `stack_overflow`, `page_fault` and `page_fault_protection`.
 - Warnings we are knowingly carrying: cargo's kebab-case binary-name suggestion, the
   future-incompatibility report about nightly's own `core` sources, and
   `unused dependency` for `bootloader`.
 - Known hazards:
-  - Only vectors 3, 8, 32 and 33 are present. Every other exception — a page fault or a
-    general protection fault from our own bug — still reaches the double-fault handler
-    (which now panics with a readable message instead of resetting the machine), but we
-    learn nothing about the original cause.
+  - Only vectors 3, 8, 14, 32 and 33 are present. Any other exception still arrives as
+    a double fault, which now panics with a readable message but tells us nothing about
+    the original cause.
   - The double-fault stack has no guard page. An overflow inside the handler itself
-    would silently corrupt whatever sits below it. Guard pages need paging, which is the
-    next chapter.
-  - `keyboard_handler` prints directly from the interrupt handler. It is short and it
-    cannot deadlock (every `WRITER` user disables interrupts), but the right design is a
-    queue the handler pushes to and normal code drains. That arrives with async/await.
+    would silently corrupt whatever sits below it. Guard pages need paging.
+  - `keyboard_handler` prints directly from the interrupt handler. It cannot deadlock
+    (every `WRITER` user disables interrupts), but the right design is a queue the
+    handler pushes to and normal code drains. That arrives with async/await.
   - Extended (0xE0) scancodes — arrows, right control, keypad — are decoded and thrown
     away.
+  - We can see *that* an address is unmapped, but not *what* the mapping is. Reading the
+    page tables is the next step.
 
 ## Next step
 
-**Paging and virtual memory.**
+**Reading the page tables the bootloader left us.**
 
-Everything we have touched so far has been at a physical address we knew by heart:
-`0xb8000` for the screen, `0x60` for the keyboard. Meanwhile the CPU has been running
-with paging on the whole time — the bootloader had to enable it to enter long mode —
-and every address our code uses is already virtual, translated by four levels of page
-tables before it reaches memory. We have simply been living inside a mapping someone
-else built for us.
+The page-fault handler tells us an address failed; it cannot tell us why the map says
+so. To answer that we have to read the four-level table the CPU walks on every single
+memory access: `CR3` holds the physical address of the level-4 table, each level has 512
+entries of 8 bytes, and 9 bits of the virtual address index each level.
 
-The next step is to look at that mapping and then take it over: read `CR3` to find the
-level-4 table, walk it, and translate an address by hand to see the four table lookups
-the hardware does on every single memory access. The obstacle is immediate and
-delicious — the page tables are stored in *physical* memory, and we can only issue
-*virtual* addresses, so reading them requires them to be mapped, which is the problem
-we are trying to solve. The `bootloader` crate offers a way out (a complete map of
-physical memory at a known offset), and the alternatives — identity mapping, recursive
-mapping — are worth understanding before picking one.
+The obstacle is immediate and is the whole lesson: **the tables are addressed
+physically, and we can only issue virtual addresses.** `CR3` says `0x1000`, and there is
+no mapping that makes physical `0x1000` reachable. We already saw the same wall from the
+outside in the walkthrough — `x /16xb` on the IDT works while `xp` on the same address
+returns zeros, and `gva2gpa` showed the kernel sitting at physical `0x16db0` while
+believing it lives at `0x21adb0`.
 
-After that, a page fault handler that prints `CR2` (the address that faulted) turns the
-double-fault safety net into a diagnosis, and a frame allocator plus the ability to map
-a new page is what makes a heap possible.
+Three ways out, and choosing between them is the step:
+
+- **Identity mapping** — map every physical frame at the identical virtual address.
+  Simple, and it fragments the address space permanently.
+- **Recursive mapping** — point one level-4 entry at the level-4 table itself, so that a
+  crafted virtual address walks the hierarchy as if it were data. Elegant, cheap, and
+  the arithmetic takes real effort to follow.
+- **A complete map of physical memory at a fixed offset** — what the `bootloader` crate
+  can do for us, and what phil-opp settles on.
+
+All three need something new from the bootloader, which is where the `bootloader`
+dependency finally stops being decorative: it can hand us a `BootInfo` struct — the
+memory map and, with the right feature, the offset of the physical-memory mapping. That
+means `_start` changes signature to accept `&'static BootInfo`, and the Cargo feature
+has to be turned on.
+
+After that: translate an address by hand and verify it against QEMU's `gva2gpa`; then a
+frame allocator and `map_page`, which is what makes a heap — and therefore `Box`, `Vec`,
+and eventually async/await — possible.
