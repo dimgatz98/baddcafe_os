@@ -358,7 +358,7 @@ target must declare the ABI too: `"rustc-abi": "softfloat"`. The built-in
 ```
    Compiling compiler_builtins v0.1.160
    Compiling core v0.0.0
-   Compiling baddcafe_os v0.1.0 (/space/dgkatzio/baddcafe_os)
+   Compiling baddcafe_os v0.1.0 (<project>)
     Finished `dev` profile [unoptimized + debuginfo] target(s) in 28.91s
 ```
 
@@ -458,10 +458,10 @@ qemu-system-x86_64 -drive format=raw,file=target/x86_64-baddcafe_os/debug/bootim
 **What happened.** No drift this time — it worked on the first attempt.
 
 ```
-   Compiling bootloader v0.9.35 (/home/dgkatzio/.cargo/registry/src/.../bootloader-0.9.35)
+   Compiling bootloader v0.9.35 (~/.cargo/registry/src/.../bootloader-0.9.35)
     Finished `release` profile [optimized + debuginfo] target(s) in 41.06s
 Created bootimage for `baddcafe_os` at
-`/space/dgkatzio/baddcafe_os/target/x86_64-baddcafe_os/debug/bootimage-baddcafe_os.bin`
+`<project>/target/x86_64-baddcafe_os/debug/bootimage-baddcafe_os.bin`
 ```
 
 One new warning, and it is a false alarm:
@@ -1965,7 +1965,7 @@ casts in one (function item -> function pointer -> integer), and spelling both o
 removes the ambiguity about which address is meant if the function is ever generic.
 
 **Environment note.** This session ran on a different machine than the one
-`/space/dgkatzio/...` paths earlier in this file came from — a fresh Windows checkout
+The `/space/...` and `/home/...` paths earlier in this file came from — a fresh Windows checkout
 with neither QEMU nor `bootimage` installed, which blocked `cargo test`/`cargo run`
 entirely at first. Installed `qemu` via `scoop install qemu` and `bootimage` via
 `cargo install bootimage`; both work, but `qemu-system-x86_64` did not end up on `PATH`

@@ -79,14 +79,6 @@ in `NOTES.md`, not in the source.
 
 ---
 
-## 2b. guides/WALKTHROUGH.md — the hands-on tour
-
-Separate from `NOTES.md` and from normal work: a step-by-step re-reading of the code
-already written, where the human runs a command, watches the machine do the thing, and
-then reads the source that causes it. It carries its own rules for the agent (one step
-per reply, four fixed parts, every command verified before it is offered) and its own
-progress list. If the human asks to "continue the walkthrough", that file is the state.
-
 ---
 
 ## 3. NOTES.md — the running journal
