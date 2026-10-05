@@ -6,12 +6,15 @@
 
 use core::panic::PanicInfo;
 
+use bootloader::BootInfo;
+
 use baddcafe_os::vga_buffer::WRITER;
-use baddcafe_os::hlt_loop;
+use baddcafe_os::{hlt_loop, memory};
 
 #[unsafe(no_mangle)]
-pub extern "C" fn _start() -> ! {
+pub extern "C" fn _start(boot_info: &'static BootInfo) -> ! {
     baddcafe_os::init();
+    memory::init(boot_info);
     WRITER.lock().clear_screen();
 
     #[cfg(test)]

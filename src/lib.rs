@@ -8,6 +8,7 @@
 pub mod gdt;
 pub mod idt;
 pub mod keyboard;
+pub mod memory;
 pub mod pic;
 pub mod port;
 pub mod serial;
@@ -76,8 +77,9 @@ pub fn test_panic_handler(info: &PanicInfo) -> ! {
 
 #[cfg(test)]
 #[unsafe(no_mangle)]
-pub extern "C" fn _start() -> ! {
+pub extern "C" fn _start(boot_info: &'static bootloader::BootInfo) -> ! {
     init();
+    memory::init(boot_info);
     test_main();
     hlt_loop()
 }
@@ -113,4 +115,44 @@ fn keyboard_decodes_a_shifted_letter() {
     assert_eq!(keyboard.decode(0xaa), None);
     assert_eq!(keyboard.decode(0x9e), None);
     assert_eq!(keyboard.decode(0x1e), Some('a'));
+}
+
+/// The VGA text buffer is memory-mapped I/O fixed by the hardware at physical
+/// 0xb8000, not ordinary RAM. We have written straight to virtual 0xb8000 since
+/// Step 5 and seen correct output on screen, which is only possible if that virtual
+/// address really resolves to the same physical one.
+#[test_case]
+fn vga_buffer_is_identity_mapped() {
+    assert_eq!(memory::translate(0xb8000), Some(0xb8000));
+}
+
+#[test_case]
+fn kernel_code_is_mapped_but_not_identity() {
+    let virt = hlt_loop as *const () as u64;
+    let phys = memory::translate(virt).expect("kernel code must be mapped to run at all");
+    assert_ne!(phys, virt);
+    // The page offset is never translated; only the frame above it changes.
+    assert_eq!(phys & 0xfff, virt & 0xfff);
+}
+
+#[test_case]
+fn a_freshly_created_mapping_is_readable_and_writable() {
+    const PROBE_VIRT: u64 = 0x1000_0000_0000;
+    assert_eq!(
+        memory::translate(PROBE_VIRT),
+        None,
+        "probe address is already mapped to something; pick a different one"
+    );
+
+    let mut allocator = memory::frame_allocator();
+    let frame = allocator.allocate_frame().expect("no usable frames left");
+    unsafe { memory::create_mapping(PROBE_VIRT, frame, &mut allocator) };
+
+    assert_eq!(memory::translate(PROBE_VIRT), Some(frame));
+
+    let ptr = PROBE_VIRT as *mut u64;
+    unsafe {
+        ptr.write_volatile(0xcafe_babe_dead_beef);
+        assert_eq!(ptr.read_volatile(), 0xcafe_babe_dead_beef);
+    }
 }

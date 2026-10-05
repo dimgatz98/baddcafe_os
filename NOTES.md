@@ -1806,6 +1806,237 @@ target is just a description it reads, not a separate build of the compiler.
 | `"features": "-mmx,-sse,+soft-float"` | Disable the SIMD units. SIMD registers are large; saving and restoring them on every interrupt is expensive, and enabling SSE properly requires setup we have not done. `soft-float` makes the compiler emulate floating point in ordinary integer instructions. |
 | `"rustc-abi": "softfloat"` | Turning off SSE changes how floats are *passed to functions* — the normal x86-64 ABI passes them in `xmm` registers, which we just disabled. Modern rustc refuses to let the feature and the ABI disagree silently, so the target must say so explicitly. |
 
+## Step 13 — Reading the page tables the bootloader left us
+
+**Goal.** Stop guessing at mappings from the outside. Walk the same four-level
+hierarchy the CPU itself walks on every memory access, from inside the kernel, and
+prove the walk is correct against addresses whose mapping we already know by other
+means.
+
+**Concept.** `CR3` holds the *physical* address of the top-level (PML4) table. Every
+memory access the kernel issues is itself a *virtual* address, translated through
+that same hierarchy before it ever reaches a real address line. To read the tables as
+data, we need a virtual address that resolves to the physical address in `CR3` — and
+by construction, none of our existing mappings do that. This is the chicken-and-egg
+problem flagged at the end of Step 12.
+
+Three standard ways out exist: identity-map all of physical RAM, recursively map the
+PML4 into itself, or have something map *all* physical RAM once at a fixed virtual
+offset. We took the third, because the `bootloader` crate can build it for us: behind
+the Cargo feature `map_physical_memory`, it maps every physical frame at
+`physical_memory_offset + frame`, and publishes that offset through a `BootInfo`
+struct handed to `_start` as `&'static BootInfo`. (Real production kernels do exactly
+this — Linux calls it the direct-mapped region of physical memory, reachable at a
+fixed `PAGE_OFFSET`.)
+
+**What we did.**
+
+```toml
+# Cargo.toml
+[dependencies]
+bootloader = { version = "0.9.35", features = ["map_physical_memory"] }
+```
+
+`_start`'s signature changed everywhere it is defined by hand — `src/main.rs` and the
+`#[cfg(test)]` entry point in `src/lib.rs` — from `extern "C" fn _start() -> !` to
+`extern "C" fn _start(boot_info: &'static bootloader::BootInfo) -> !`. We did not reach
+for the crate's `entry_point!` macro: it only buys compile-time type-checking of the
+signature, and this project hand-rolls `_start` on purpose, the same way it hand-rolled
+the IDT and GDT instead of using the `x86_64` crate. The three existing integration
+tests (`stack_overflow.rs`, `page_fault.rs`, `page_fault_protection.rs`) were left
+exactly as they are: their `_start` still takes no parameters, and the unused
+`boot_info` argument the bootloader passes in a register is simply never read — which
+is also, in hindsight, why a zero-argument `_start` has worked since Step 2 without
+anyone ever having to tell the bootloader to stop passing it.
+
+New module, `src/memory.rs`, hand-rolled like everything else in this kernel:
+
+- `Entry` — a newtype over `u64`. `is_present`, `is_huge_page`, `addr` (masked to bits
+  12-51, the physical address width) and `set`.
+- `Table` — `#[repr(C, align(4096))]`, 512 entries, matching the hardware's own layout
+  exactly, the same reasoning as `Idt`'s `repr(C, align(16))` in Step 9.
+- `table_at` / `table_at_mut` — the one load-bearing idea in the module: given a
+  *physical* address, add `physical_memory_offset` and dereference the result as a
+  `Table`. This is the only place physical addresses ever get turned into something
+  the CPU can actually touch.
+- `translate(virt) -> Option<u64>` — walks PML4 -> PDPT -> PD -> PT by hand, exactly
+  mirroring the hardware, through `table_at` instead of silicon. Handles huge-page
+  entries (2 MiB at the PD level, 1 GiB at the PDPT level) by widening the untranslated
+  offset instead of assuming every entry bottoms out at a 4 KiB `PT` — necessary
+  because the bootloader's own physical-memory mapping covers all of RAM using 2 MiB
+  pages, confirmed by reading `bootloader-0.9.35/src/main.rs` directly.
+- `FrameAllocator` — walks `BootInfo`'s `MemoryMap`, filters frames marked `Usable`,
+  hands them out once each. Re-walks the map from scratch on every call: wasteful, but
+  the same trade-off phil-opp's own first allocator makes, and explicitly a problem for
+  the next roadmap step (Allocator Designs) to improve, not this one.
+- `create_mapping(virt, frame, allocator)` — the write side: walks the same four
+  levels, and where an intermediate table is missing, allocates a fresh frame for it,
+  zeroes it (an unzeroed table hands the next lookup 512 entries of garbage that can
+  look "present" by accident), and links it in. Finishes with `invlpg` so the CPU's TLB
+  does not keep serving a stale "not present" for an address it cached before the
+  mapping existed.
+
+Three new `#[test_case]`s in `src/lib.rs`, chosen so each proves something we could not
+already have assumed:
+
+```rust
+#[test_case]
+fn vga_buffer_is_identity_mapped() {
+    assert_eq!(memory::translate(0xb8000), Some(0xb8000));
+}
+```
+
+The VGA text buffer is memory-mapped I/O fixed by the graphics hardware at physical
+`0xb8000` — not negotiable, not something the bootloader chooses. We have written to
+virtual `0xb8000` since Step 5 and seen correct output on a real screen, which is only
+possible if that virtual address really does resolve to the same physical one. This
+test turns an assumption we have been quietly relying on for eight steps into a
+checked fact.
+
+```rust
+#[test_case]
+fn kernel_code_is_mapped_but_not_identity() {
+    let virt = hlt_loop as *const () as u64;
+    let phys = memory::translate(virt).expect("kernel code must be mapped to run at all");
+    assert_ne!(phys, virt);
+    assert_eq!(phys & 0xfff, virt & 0xfff);
+}
+```
+
+Confirms the opposite case: our own code is *not* identity-mapped (matching what
+`gva2gpa` already showed us from outside the machine, back in Step 12's notes), while
+the low 12 bits — the in-page offset, which no level of the walk ever touches — must
+still agree between virtual and physical.
+
+```rust
+#[test_case]
+fn a_freshly_created_mapping_is_readable_and_writable() {
+    const PROBE_VIRT: u64 = 0x1000_0000_0000;
+    assert_eq!(memory::translate(PROBE_VIRT), None, "probe address already in use");
+
+    let mut allocator = memory::frame_allocator();
+    let frame = allocator.allocate_frame().expect("no usable frames left");
+    unsafe { memory::create_mapping(PROBE_VIRT, frame, &mut allocator) };
+
+    assert_eq!(memory::translate(PROBE_VIRT), Some(frame));
+
+    let ptr = PROBE_VIRT as *mut u64;
+    unsafe {
+        ptr.write_volatile(0xcafe_babe_dead_beef);
+        assert_eq!(ptr.read_volatile(), 0xcafe_babe_dead_beef);
+    }
+}
+```
+
+The strongest of the three: it does not just read the existing tables, it *writes* a
+brand new mapping and proves the hardware actually honours it, round-tripping a
+sentinel value through a virtual address that did not resolve to anything a moment
+earlier. The `None` assertion first is not decoration — it is what makes the test
+trustworthy regardless of where the bootloader happened to place the kernel, its stack,
+or the physical-memory mapping on a given run.
+
+A quirk worth recording: the first version of the second test tried to take the
+address of another `#[test_case]`-annotated function directly —
+
+```
+error[E0425]: cannot find value `keyboard_decodes_a_shifted_letter` in this scope
+   |
+   | you might have meant to refer to this function
+```
+
+— which rustc reported as both "this is a function" and "not found" in the same
+breath. Whatever `custom_test_frameworks` does internally to collect `#[test_case]`
+items on this nightly, it makes the original item unusable as an ordinary value from
+elsewhere in the same module. Fixed by pointing at an ordinary function
+(`hlt_loop`, not `#[test_case]`-tagged) instead — not investigated further, since the
+test's point survives perfectly well either way, but filed here so it is not
+rediscovered the hard way.
+
+A second, unrelated nightly complaint:
+
+```
+warning: direct cast of function item into an integer
+help: first cast to a pointer `as *const ()`
+```
+
+Fixed by casting through `*const ()` first. The warning is right to exist: a bare
+function item is zero-sized and has its own unique type; `as u64` on it is really two
+casts in one (function item -> function pointer -> integer), and spelling both out
+removes the ambiguity about which address is meant if the function is ever generic.
+
+**Environment note.** This session ran on a different machine than the one
+`/space/dgkatzio/...` paths earlier in this file came from — a fresh Windows checkout
+with neither QEMU nor `bootimage` installed, which blocked `cargo test`/`cargo run`
+entirely at first. Installed `qemu` via `scoop install qemu` and `bootimage` via
+`cargo install bootimage`; both work, but `qemu-system-x86_64` did not end up on `PATH`
+through a scoop shim and has to be added manually
+(`$HOME/scoop/apps/qemu/current`), and its monitor's `stdio` mode echoes raw input
+characters when driven through a non-interactive pipe on Windows, which broke the
+`pmemsave`-based screen-reading recipe from the Reference section. Serial output was
+unaffected and remains the reliable channel on this machine.
+
+**What happened.**
+
+```
+Running 7 tests
+baddcafe_os::a_freshly_created_mapping_is_readable_and_writable... [ok]
+baddcafe_os::breakpoint_exception_returns... EXCEPTION: BREAKPOINT
+InterruptStackFrame { ... }
+[ok]
+baddcafe_os::kernel_code_is_mapped_but_not_identity... [ok]
+baddcafe_os::keyboard_decodes_a_shifted_letter... [ok]
+baddcafe_os::timer_interrupt_fires... [ok]
+baddcafe_os::trivial_assertion... [ok]
+baddcafe_os::vga_buffer_is_identity_mapped... [ok]
+```
+
+All three existing integration kernels (`stack_overflow`, `page_fault`,
+`page_fault_protection`) still pass unchanged. The production kernel, booted headless
+with serial captured to a file:
+
+```
+BaddCafe OS: serial is alive on COM1
+EXCEPTION: BREAKPOINT
+InterruptStackFrame {
+    instruction_pointer: 0x206269,
+    code_segment: 0x8,
+    cpu_flags: 0x206,
+    stack_pointer: 0x10000201e78,
+    stack_segment: 0x0,
+}
+```
+
+No page fault, no double fault, no reset in the run — `init()` followed by
+`memory::init(boot_info)` followed by the full banner path, including the deliberate
+`int3`, completed cleanly. The `unused dependency: bootloader` warning that has been
+carried since Step 4 is also gone on its own: the crate is finally `use`d for real.
+
+**Why.** The whole step rests on one fact we did not have to build, only trust: the
+bootloader's own doc comment on `physical_memory_offset` says plainly that regions not
+marked `Usable` (including, per `MemoryRegionType`, anything the bootloader used for
+its own page tables) must not be treated as free. Our `FrameAllocator` only ever hands
+out `Usable` frames, which is exactly what keeps a freshly allocated table frame from
+ever colliding with a table frame the bootloader is still using to keep *us* running.
+
+**Rust concepts touched.**
+
+- `&'static BootInfo` as a parameter, not a return type — the lifetime says the
+  pointee outlives the whole kernel, which is true here because the bootloader placed
+  it in memory that is never reclaimed, the same reasoning `Idt::load(&'static self)`
+  relied on in Step 9.
+- A manual 4-level pointer-chasing loop as the realistic alternative to the `x86_64`
+  crate's `Mapper`/`PageTable` abstractions — the trade-off this project keeps making:
+  more code, in exchange for nothing hidden.
+- `impl Iterator<Item = u64>` as a return type (`usable_frames`) — a method that
+  returns "some iterator, whose concrete type is this function's own business," built
+  from `filter`/`flat_map`/`map` over the memory map without allocating anything, which
+  matters here as much as it did for `format_args!` in Step 6: there is still no heap.
+- `#[repr(transparent)]` vs `#[repr(C)]` revisited: `Entry` is the former (one `u64`,
+  nothing more, purely for our own ergonomics), `Table` is the latter (hardware layout,
+  non-negotiable) — the same distinction `ColorCode` vs `ScreenChar` drew in Step 5.
+
+---
+
 ### R2. Commands
 
 #### Source layout
@@ -1817,6 +2048,8 @@ src/vga_buffer.rs  the VGA text buffer: Color, ColorCode, ScreenChar, Writer,
                    the global WRITER, and the print!/println! macros
 src/idt.rs         the Interrupt Descriptor Table: Entry, Idt, InterruptStackFrame,
                    the breakpoint handler, and init()
+src/memory.rs      the hand-rolled page-table walker: translate(), FrameAllocator,
+                   create_mapping(), through the bootloader's physical-memory offset
 src/port.rs        port-mapped I/O primitives: outb, outl, inb
 src/serial.rs      the 16550 UART on COM1: Serial, the global SERIAL, and the
                    serial_print!/serial_println! macros
@@ -2065,22 +2298,31 @@ evidence that all three rungs were climbed before control reached `_start`.
 
 - Branch `master`. Committed: `75d458e` (steps 0-3), `d40df33` (step 4), `3fa414d`
   (steps 5-6), `ae7a1a8` (step 7), `da2a262` (step 8), `fd8bae1` (step 9), `d17b0df`
-  (steps 10-11). Step 12 is committed alongside this entry.
-- Toolchain: nightly `1.100.0-nightly (a69a63265 2026-09-03)`, pinned by
-  `rust-toolchain.toml`, with `rust-src` and `llvm-tools-preview`.
+  (steps 10-11), `905b84f` (step 12). Step 13 is uncommitted as of this entry.
+- Toolchain: nightly, pinned by `rust-toolchain.toml`, with `rust-src` and
+  `llvm-tools-preview`. This session ran on a different, fresh machine than earlier
+  ones (see Step 13's environment note); the exact nightly snapshot it picked up was
+  newer (`1.101.0-nightly`, 2026-10-04) than the one steps 0-12 were built with
+  (`1.100.0-nightly`, 2026-09-03) — expected, since the toolchain file pins a channel,
+  not a date, and no drift was hit this time.
 - Edition 2024. `panic = "abort"` on both profiles, `panic-abort-tests = true`.
   Unstable features in use: `custom_test_frameworks`, `abi_x86_interrupt`.
-- Dependencies: `bootloader = "0.9.35"` (read by `bootimage`, never linked) and
+- Dependencies: `bootloader = { version = "0.9.35", features = ["map_physical_memory"] }`
+  (now actually `use`d, for `BootInfo`, not just read by `bootimage`) and
   `spin = "0.12.3"` (`Mutex` behind `WRITER`/`SERIAL`/`KEYBOARD`, `Once` behind the
-  `IDT`, the `GDT`, the `TSS` and each test kernel's own IDT).
+  `IDT`, the `GDT`, the `TSS`, each test kernel's own IDT, and now `memory`'s offset
+  and memory-map globals).
 - The crate is a library plus a binary:
   - `src/lib.rs` — modules, `init()` (serial → GDT → IDT → PIC → `sti`), `hlt_loop()`,
     `QemuExitCode`, `exit_qemu`, `Testable`, `test_runner`, `test_panic_handler`, and a
-    `#[cfg(test)]` `_start`/panic handler for the library's own test kernel. Four test
-    cases live here.
-  - `src/main.rs` — `_start`, the banner, the two panic handlers split on `cfg(test)`.
+    `#[cfg(test)]` `_start(boot_info: &'static BootInfo)`/panic handler for the
+    library's own test kernel. Seven test cases live here.
+  - `src/main.rs` — `_start(boot_info: &'static BootInfo)`, the banner, the two panic
+    handlers split on `cfg(test)`.
   - `tests/stack_overflow.rs`, `tests/page_fault.rs`,
-    `tests/page_fault_protection.rs` — three separate kernels, `harness = false`.
+    `tests/page_fault_protection.rs` — three separate kernels, `harness = false`,
+    still with a zero-argument `_start`; they never needed `boot_info` and the
+    bootloader does not mind it going unread.
 - `src/gdt.rs`: `Tss` (`repr(C, packed(4))`), a 20 KiB `UnsafeCell` stack for the
   double-fault handler, an eight-slot `Gdt` with a null descriptor, a ring-0 code
   segment and a 16-byte TSS descriptor, `lgdt`, a `retfq` trampoline to reload `cs`,
@@ -2090,6 +2332,11 @@ evidence that all three rungs were climbed before control reached `_start`.
   handlers for breakpoint (3), double fault (8, on IST 0), page fault (14), timer (32)
   and keyboard (33), the `PageFaultErrorCode` newtype, `read_cr2`, a `TICKS` counter,
   and `enable`/`disable`/`are_enabled`/`without_interrupts`.
+- `src/memory.rs`: the hand-written page-table walker — `Entry`, `Table`
+  (`repr(C, align(4096))`), `translate()` (handles 2 MiB/1 GiB huge pages), a
+  from-scratch `FrameAllocator` over `BootInfo`'s memory map, and
+  `create_mapping()`, all reached through the bootloader's physical-memory-offset
+  mapping (`table_at`/`table_at_mut`). No `x86_64` crate.
 - `src/pic.rs`: the two 8259s remapped to 32-47, all lines masked except timer,
   keyboard and the cascade, plus `end_of_interrupt` and `io_wait`.
 - `src/keyboard.rs`: scancode set 1 decoded through two 0x40-entry `char` tables, with
@@ -2097,58 +2344,47 @@ evidence that all three rungs were climbed before control reached `_start`.
 - `src/vga_buffer.rs`: the `Writer`, plus backspace, hardware cursor updates through
   ports 0x3D4/0x3D5, and `_print` wrapped in `without_interrupts`. `src/serial.rs`
   likewise.
-- **`cargo run` boots and the keyboard types on the screen. `cargo test` runs seven
-  tests across four kernels and exits 0.** Verified: four library tests, plus
-  `stack_overflow`, `page_fault` and `page_fault_protection`.
-- Warnings we are knowingly carrying: cargo's kebab-case binary-name suggestion, the
-  future-incompatibility report about nightly's own `core` sources, and
-  `unused dependency` for `bootloader`.
+- **`cargo run` boots and the keyboard types on the screen. `cargo test` runs ten
+  tests across four kernels and exits 0.** Verified: seven library tests (four from
+  before, plus `vga_buffer_is_identity_mapped`, `kernel_code_is_mapped_but_not_identity`
+  and `a_freshly_created_mapping_is_readable_and_writable`), plus `stack_overflow`,
+  `page_fault` and `page_fault_protection` unchanged.
+- Warnings we are knowingly carrying: cargo's kebab-case binary-name suggestion, and
+  the future-incompatibility report about nightly's own `core` sources. The
+  `unused dependency: bootloader` warning carried since Step 4 is gone — the crate is
+  `use`d for real now.
 - Known hazards:
   - Only vectors 3, 8, 14, 32 and 33 are present. Any other exception still arrives as
     a double fault, which now panics with a readable message but tells us nothing about
     the original cause.
   - The double-fault stack has no guard page. An overflow inside the handler itself
-    would silently corrupt whatever sits below it. Guard pages need paging.
+    would silently corrupt whatever sits below it. A real guard page (present-bit
+    cleared, so overflowing into it page-faults instead of corrupting memory) is now
+    possible to build with `memory.rs`, but has not been done yet.
   - `keyboard_handler` prints directly from the interrupt handler. It cannot deadlock
     (every `WRITER` user disables interrupts), but the right design is a queue the
     handler pushes to and normal code drains. That arrives with async/await.
   - Extended (0xE0) scancodes — arrows, right control, keypad — are decoded and thrown
     away.
-  - We can see *that* an address is unmapped, but not *what* the mapping is. Reading the
-    page tables is the next step.
+  - `FrameAllocator` re-walks the whole memory map on every `allocate_frame()` call —
+    correct, and explicitly a problem for the Allocator Designs step to improve, not
+    this one.
+  - `create_mapping` does not set the `NO_EXECUTE` bit on anything; every page it
+    creates is executable by default. Fine for a test mapping, not fine for a heap.
 
 ## Next step
 
-**Reading the page tables the bootloader left us.**
+**Heap allocation.**
 
-The page-fault handler tells us an address failed; it cannot tell us why the map says
-so. To answer that we have to read the four-level table the CPU walks on every single
-memory access: `CR3` holds the physical address of the level-4 table, each level has 512
-entries of 8 bytes, and 9 bits of the virtual address index each level.
+With `memory::frame_allocator()` and `memory::create_mapping()` both proven correct,
+the pieces needed for a heap already exist: pick a fixed, currently-unused range of
+virtual addresses, call `create_mapping` for each page in it against a freshly
+allocated frame, and the kernel has a region of memory it is allowed to grow into.
 
-The obstacle is immediate and is the whole lesson: **the tables are addressed
-physically, and we can only issue virtual addresses.** `CR3` says `0x1000`, and there is
-no mapping that makes physical `0x1000` reachable. We already saw the same wall from the
-outside in the walkthrough — `x /16xb` on the IDT works while `xp` on the same address
-returns zeros, and `gva2gpa` showed the kernel sitting at physical `0x16db0` while
-believing it lives at `0x21adb0`.
-
-Three ways out, and choosing between them is the step:
-
-- **Identity mapping** — map every physical frame at the identical virtual address.
-  Simple, and it fragments the address space permanently.
-- **Recursive mapping** — point one level-4 entry at the level-4 table itself, so that a
-  crafted virtual address walks the hierarchy as if it were data. Elegant, cheap, and
-  the arithmetic takes real effort to follow.
-- **A complete map of physical memory at a fixed offset** — what the `bootloader` crate
-  can do for us, and what phil-opp settles on.
-
-All three need something new from the bootloader, which is where the `bootloader`
-dependency finally stops being decorative: it can hand us a `BootInfo` struct — the
-memory map and, with the right feature, the offset of the physical-memory mapping. That
-means `_start` changes signature to accept `&'static BootInfo`, and the Cargo feature
-has to be turned on.
-
-After that: translate an address by hand and verify it against QEMU's `gva2gpa`; then a
-frame allocator and `map_page`, which is what makes a heap — and therefore `Box`, `Vec`,
-and eventually async/await — possible.
+What is still missing is turning that region into something `alloc::boxed::Box`,
+`Vec` and `String` can use: an `impl GlobalAlloc` registered with
+`#[global_allocator]`, which means deciding on an allocation strategy for the first
+time — even a minimal bump allocator has to track an allocation pointer and answer
+`alloc`/`dealloc` without ever corrupting its own bookkeeping. That one, simple design
+is this step's job; comparing it against better ones (linked-list, fixed-size block)
+is explicitly the step after.
