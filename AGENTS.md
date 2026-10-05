@@ -79,8 +79,6 @@ in `NOTES.md`, not in the source.
 
 ---
 
----
-
 ## 3. NOTES.md — the running journal
 
 `NOTES.md` is a **continuous, human-readable log of the journey**, written for
@@ -129,12 +127,16 @@ someone who is new to both bare-metal OS development and Rust.
 
 | Piece | Value |
 |---|---|
-| Host | Linux x86-64 |
+| Host | Linux x86-64 (Steps 0-12); Windows 11 (Step 13 onward) |
 | Toolchain | nightly, pinned per-project via `rust-toolchain.toml` |
 | Components | `rust-src`, `llvm-tools-preview` |
 | Edition | 2024 |
-| QEMU | 8.2.2 |
+| QEMU | 8.2.2 on Linux; 11.1.0 on Windows (`scoop install qemu`) |
 | Bootloader tool | `bootimage` (installed via `cargo install bootimage`) |
+
+On Windows, scoop's `qemu-system-x86_64.exe` is not on `PATH` by default; add
+`$HOME/scoop/apps/qemu/current` to `PATH` for the shell session before `cargo run` or
+`cargo test`, or the runner fails with "no such command".
 
 Nightly is required, not optional: `-Z build-std` (recompiling `core` for a target
 that has no prebuilt standard library) is an unstable feature. `rust-src` supplies
@@ -154,21 +156,26 @@ the blog and the compiler disagree, the compiler wins.
 
 ## 5. Where we are right now
 
-Steps 0-11 are done (see `NOTES.md` for the full story, and its `Current state`
+Steps 0-13 are done (see `NOTES.md` for the full story, and its `Current state`
 section for the authoritative snapshot):
 
 - A freestanding kernel on a custom bare-metal target, booting in QEMU through
   `bootimage`, with our own VGA text buffer, `println!`, serial output on COM1 and a
   custom test framework that exits QEMU by itself.
-- A hand-written IDT with handlers for breakpoint and double fault, the latter on its
-  own stack through a hand-written GDT and TSS.
+- A hand-written IDT with handlers for breakpoint, double fault, and page fault. The
+  double fault runs on its own stack through a hand-written GDT and TSS.
 - The two 8259 PICs remapped above the exception vectors, the timer counting ticks and
   the keyboard decoding scancodes onto the screen.
+- Paging: a hand-written 4-level page table walker (`src/memory.rs`), a frame
+  allocator over the bootloader's memory map, and `create_mapping`. Reads go through
+  the bootloader's physical-memory offset (`map_physical_memory` feature).
 - The crate is a library (`src/lib.rs`) plus a thin binary (`src/main.rs`), so
   integration tests under `tests/` can be whole kernels of their own.
+- `_start` takes `&'static BootInfo` from the bootloader. Tests that need no
+  `BootInfo` still use a zero-argument `_start`.
 
-**Next step:** paging and virtual memory — walking the page tables the bootloader left
-us, then building our own mapping and a page-fault handler.
+**Next step:** heap allocation — map a fixed virtual range to frames, then implement
+`GlobalAlloc` with a simple bump allocator so `Box`, `Vec` and `String` work.
 
 ## 6. Roadmap
 
@@ -183,7 +190,7 @@ Rough phil-opp order. Tick items off as `NOTES.md` records them.
 - [x] CPU exceptions and the IDT (Interrupt Descriptor Table)
 - [x] Double faults and the IST (Interrupt Stack Table)
 - [x] Hardware interrupts — PIC, timer, keyboard
-- [ ] Paging and virtual memory
+- [x] Paging and virtual memory
 - [ ] Heap allocation
 - [ ] Allocator designs
 - [ ] Async/await and cooperative multitasking
@@ -212,6 +219,9 @@ Rough phil-opp order. Tick items off as `NOTES.md` records them.
   message stays short — a one-line subject, and at most a few bullet lines when the
   change really needs them. No paragraphs, no restating the diff: the explanation
   and the *why* belong in `NOTES.md`, which the commit accompanies.
+- **README.md is the entry point for outsiders.** Keep its status section, run/test
+  instructions, layout table and license pointer current whenever they change. It
+  stays short: no step-by-step detail, which belongs in `NOTES.md`.
 - **Never silence a warning you do not understand.** Understand first, then decide.
 - **Prefer safe Rust; justify every `unsafe`.** In a kernel `unsafe` is unavoidable,
   but every block should be small, and the human should be able to state the
@@ -232,6 +242,8 @@ is edited rather than appended to.
 rustc --version                 # confirm nightly is active in this directory
 rustup show active-toolchain    # confirm the rust-toolchain.toml override applies
 cargo build                     # the main feedback loop
+cargo run                       # build the disk image and boot it in QEMU
+cargo test                      # boot each test kernel; exits 0 on success
 nm <file.o>                     # list symbols: T = defined, U = undefined
 readelf -h <binary>             # ELF header, including the e_entry entry point
 objdump -d <binary>             # disassemble
