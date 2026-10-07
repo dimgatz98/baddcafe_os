@@ -4,17 +4,20 @@
 #![test_runner(baddcafe_os::test_runner)]
 #![reexport_test_harness_main = "test_main"]
 
+extern crate alloc;
+
 use core::panic::PanicInfo;
 
 use bootloader::BootInfo;
 
 use baddcafe_os::vga_buffer::WRITER;
-use baddcafe_os::{hlt_loop, memory};
+use baddcafe_os::{allocator, hlt_loop, memory};
 
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(boot_info: &'static BootInfo) -> ! {
     baddcafe_os::init();
     memory::init(boot_info);
+    allocator::init_heap().expect("heap initialization failed");
     WRITER.lock().clear_screen();
 
     #[cfg(test)]
@@ -28,6 +31,9 @@ pub extern "C" fn _start(boot_info: &'static BootInfo) -> ! {
 
 #[cfg(not(test))]
 fn banner() {
+    use alloc::boxed::Box;
+    use alloc::vec::Vec;
+
     use baddcafe_os::{idt, println, serial_println};
     use baddcafe_os::vga_buffer::{Color, ColorCode};
 
@@ -48,6 +54,10 @@ fn banner() {
         .set_color(ColorCode::new(Color::LightGray, Color::Black));
     idt::int3();
     println!("...and we came back from the exception.");
+
+    let squares: Vec<u64> = (1..=8).map(|n| n * n).collect();
+    let boxed = Box::new(0xbadd_cafe_u64);
+    println!("Heap: {:?}, {:#x} at {:p}", squares, *boxed, boxed);
 
     println!();
     println!("Timer and keyboard interrupts are on. Type:");

@@ -5,6 +5,9 @@
 #![test_runner(crate::test_runner)]
 #![reexport_test_harness_main = "test_main"]
 
+extern crate alloc;
+
+pub mod allocator;
 pub mod gdt;
 pub mod idt;
 pub mod keyboard;
@@ -80,6 +83,7 @@ pub fn test_panic_handler(info: &PanicInfo) -> ! {
 pub extern "C" fn _start(boot_info: &'static bootloader::BootInfo) -> ! {
     init();
     memory::init(boot_info);
+    allocator::init_heap().expect("heap initialization failed");
     test_main();
     hlt_loop()
 }
@@ -146,7 +150,8 @@ fn a_freshly_created_mapping_is_readable_and_writable() {
 
     let mut allocator = memory::frame_allocator();
     let frame = allocator.allocate_frame().expect("no usable frames left");
-    unsafe { memory::create_mapping(PROBE_VIRT, frame, &mut allocator) };
+    unsafe { memory::create_mapping(PROBE_VIRT, frame, memory::WRITABLE, &mut allocator) }
+        .expect("mapping the probe page failed");
 
     assert_eq!(memory::translate(PROBE_VIRT), Some(frame));
 
@@ -155,4 +160,59 @@ fn a_freshly_created_mapping_is_readable_and_writable() {
         ptr.write_volatile(0xcafe_babe_dead_beef);
         assert_eq!(ptr.read_volatile(), 0xcafe_babe_dead_beef);
     }
+}
+
+#[test_case]
+fn mapping_the_same_page_twice_is_refused() {
+    let mut allocator = memory::frame_allocator();
+    let frame = allocator.allocate_frame().expect("no usable frames left");
+    let result = unsafe {
+        memory::create_mapping(allocator::HEAP_START, frame, memory::WRITABLE, &mut allocator)
+    };
+    assert_eq!(result, Err(memory::MapError::AlreadyMapped));
+}
+
+#[test_case]
+fn bump_allocator_aligns_and_reclaims() {
+    use allocator::BumpAllocator;
+    use core::alloc::Layout;
+
+    // Addresses only: the bump logic never touches the memory it hands out.
+    let mut bump = BumpAllocator::new();
+    unsafe { bump.init(0x1000, 0x100) };
+
+    let a = bump.alloc(Layout::from_size_align(1, 1).unwrap());
+    let b = bump.alloc(Layout::from_size_align(8, 64).unwrap());
+    assert_eq!(a as usize, 0x1000);
+    assert_eq!(b as usize, 0x1040);
+
+    bump.dealloc();
+    bump.dealloc();
+    let c = bump.alloc(Layout::from_size_align(1, 1).unwrap());
+    assert_eq!(c as usize, 0x1000, "heap not reclaimed after the last dealloc");
+}
+
+#[test_case]
+fn bump_allocator_refuses_what_does_not_fit() {
+    use allocator::BumpAllocator;
+    use core::alloc::Layout;
+
+    let mut bump = BumpAllocator::new();
+    assert!(bump.alloc(Layout::from_size_align(1, 1).unwrap()).is_null());
+
+    unsafe { bump.init(0x1000, 0x100) };
+    assert!(bump.alloc(Layout::from_size_align(0x101, 1).unwrap()).is_null());
+    assert!(!bump.alloc(Layout::from_size_align(0x100, 1).unwrap()).is_null());
+    assert!(bump.alloc(Layout::from_size_align(1, 1).unwrap()).is_null());
+}
+
+#[test_case]
+fn bump_allocator_never_wraps_around() {
+    use allocator::BumpAllocator;
+    use core::alloc::Layout;
+
+    let mut bump = BumpAllocator::new();
+    unsafe { bump.init(usize::MAX - 0x20, 0x20) };
+    assert!(bump.alloc(Layout::from_size_align(1, 0x40).unwrap()).is_null());
+    assert!(bump.alloc(Layout::from_size_align(usize::MAX / 2, 1).unwrap()).is_null());
 }

@@ -25,6 +25,10 @@ harness = false
 name = "page_fault_protection"
 harness = false
 
+[[test]]
+name = "heap_no_execute"
+harness = false
+
 [dependencies]
 bootloader = { version = "0.9.35", features = ["map_physical_memory"] }
 spin = "0.12.3"

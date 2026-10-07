@@ -2,13 +2,16 @@ use core::arch::asm;
 
 use bootloader::BootInfo;
 use bootloader::bootinfo::{MemoryMap, MemoryRegionType};
-use spin::Once;
+use spin::{Mutex, MutexGuard, Once};
 
 pub const PAGE_SIZE: u64 = 4096;
 
 const PRESENT: u64 = 1 << 0;
-const WRITABLE: u64 = 1 << 1;
+pub const WRITABLE: u64 = 1 << 1;
 const HUGE_PAGE: u64 = 1 << 7;
+/// Honoured only because the bootloader sets EFER.NXE; with NXE clear, bit 63 is
+/// reserved and setting it would page-fault on every access.
+pub const NO_EXECUTE: u64 = 1 << 63;
 
 /// Bits 12-51: the hardware's physical address width. Bits 0-11 are flags, not
 /// address, on every entry.
@@ -73,7 +76,10 @@ fn flush_tlb(virt: u64) {
 /// at virtual address `offset + p`, because the bootloader mapped every usable frame
 /// there before jumping to us. See `init`.
 static PHYSICAL_MEMORY_OFFSET: Once<u64> = Once::new();
-static MEMORY_MAP: Once<&'static MemoryMap> = Once::new();
+
+/// One allocator for the whole kernel: two independent ones walking the same memory
+/// map would hand out the same frames twice.
+static FRAME_ALLOCATOR: Once<Mutex<FrameAllocator>> = Once::new();
 
 fn offset() -> u64 {
     *PHYSICAL_MEMORY_OFFSET
@@ -99,7 +105,12 @@ fn table_at_mut(phys_addr: u64) -> &'static mut Table {
 /// `BootInfo` the bootloader handed to `_start`.
 pub fn init(boot_info: &'static BootInfo) {
     PHYSICAL_MEMORY_OFFSET.call_once(|| boot_info.physical_memory_offset);
-    MEMORY_MAP.call_once(|| &boot_info.memory_map);
+    FRAME_ALLOCATOR.call_once(|| {
+        Mutex::new(FrameAllocator {
+            memory_map: &boot_info.memory_map,
+            next: 0,
+        })
+    });
 }
 
 /// Walks the same four levels the CPU itself walks for `virt`, through the
@@ -157,39 +168,67 @@ impl FrameAllocator {
     }
 }
 
-pub fn frame_allocator() -> FrameAllocator {
-    FrameAllocator {
-        memory_map: MEMORY_MAP.get().expect("memory::init was not called"),
-        next: 0,
-    }
+/// Not for use from interrupt handlers: one arriving while the lock is held would
+/// spin on it forever.
+pub fn frame_allocator() -> MutexGuard<'static, FrameAllocator> {
+    FRAME_ALLOCATOR
+        .get()
+        .expect("memory::init was not called")
+        .lock()
 }
 
-/// Creates a new 4 KiB mapping from `virt` to `frame`, both already page-aligned,
-/// allocating whatever intermediate tables are missing from `allocator` and zeroing
-/// each one before linking it in — an unzeroed table would hand the next lookup 512
-/// entries of garbage that happen to look present.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MapError {
+    Unaligned,
+    AlreadyMapped,
+    /// An intermediate entry on the way down is a huge page, so there is no table
+    /// below it to put a 4 KiB entry in.
+    InsideHugePage,
+    OutOfFrames,
+}
+
+/// Creates a new 4 KiB mapping from `virt` to `frame` with `flags` (on top of
+/// `PRESENT`), allocating whatever intermediate tables are missing from `allocator`
+/// and zeroing each one before linking it in — an unzeroed table would hand the next
+/// lookup 512 entries of garbage that happen to look present.
+///
+/// Intermediate entries get `WRITABLE` and never `NO_EXECUTE`: the CPU combines the
+/// permissions of every level, so restrictions belong on the leaf only.
 ///
 /// # Safety
 ///
-/// `virt` must not already be in use for something else, and `frame` must not be
-/// reachable through any other mapping — exactly what `allocator` promises as long as
-/// it is only ever fed the bootloader's own memory map.
-pub unsafe fn create_mapping(virt: u64, frame: u64, allocator: &mut FrameAllocator) {
+/// `frame` must not be reachable through any other mapping and must not hold anything
+/// still in use — exactly what `allocator` promises for the frames it hands out.
+pub unsafe fn create_mapping(
+    virt: u64,
+    frame: u64,
+    flags: u64,
+    allocator: &mut FrameAllocator,
+) -> Result<(), MapError> {
+    if !virt.is_multiple_of(PAGE_SIZE) || !frame.is_multiple_of(PAGE_SIZE) {
+        return Err(MapError::Unaligned);
+    }
+
     let mut table_phys = read_cr3();
 
     for level in (1..=3).rev() {
         let table = table_at_mut(table_phys);
         let idx = index(virt, level);
         if !table.entries[idx].is_present() {
-            let new_table = allocator
-                .allocate_frame()
-                .expect("out of physical frames for a new page table");
+            let new_table = allocator.allocate_frame().ok_or(MapError::OutOfFrames)?;
             table_at_mut(new_table).zero();
             table.entries[idx].set(new_table, WRITABLE);
+        } else if table.entries[idx].is_huge_page() {
+            return Err(MapError::InsideHugePage);
         }
         table_phys = table.entries[idx].addr();
     }
 
-    table_at_mut(table_phys).entries[index(virt, 0)].set(frame, WRITABLE);
+    let leaf = &mut table_at_mut(table_phys).entries[index(virt, 0)];
+    if leaf.is_present() {
+        return Err(MapError::AlreadyMapped);
+    }
+    leaf.set(frame, flags);
     flush_tlb(virt);
+    Ok(())
 }

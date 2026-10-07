@@ -156,7 +156,7 @@ the blog and the compiler disagree, the compiler wins.
 
 ## 5. Where we are right now
 
-Steps 0-13 are done (see `NOTES.md` for the full story, and its `Current state`
+Steps 0-14 are done (see `NOTES.md` for the full story, and its `Current state`
 section for the authoritative snapshot):
 
 - A freestanding kernel on a custom bare-metal target, booting in QEMU through
@@ -173,9 +173,12 @@ section for the authoritative snapshot):
   integration tests under `tests/` can be whole kernels of their own.
 - `_start` takes `&'static BootInfo` from the bootloader. Tests that need no
   `BootInfo` still use a zero-argument `_start`.
+- A 1 MiB kernel heap (`src/allocator.rs`), mapped writable and non-executable, behind
+  a bump allocator registered as `#[global_allocator]`, so `alloc`'s `Box`, `Vec` and
+  `String` work.
 
-**Next step:** heap allocation — map a fixed virtual range to frames, then implement
-`GlobalAlloc` with a simple bump allocator so `Box`, `Vec` and `String` work.
+**Next step:** allocator designs — replace the bump allocator with ones that can reuse
+individual freed blocks (linked list, fixed-size blocks).
 
 ## 6. Roadmap
 
@@ -191,7 +194,7 @@ Rough phil-opp order. Tick items off as `NOTES.md` records them.
 - [x] Double faults and the IST (Interrupt Stack Table)
 - [x] Hardware interrupts — PIC, timer, keyboard
 - [x] Paging and virtual memory
-- [ ] Heap allocation
+- [x] Heap allocation
 - [ ] Allocator designs
 - [ ] Async/await and cooperative multitasking
 

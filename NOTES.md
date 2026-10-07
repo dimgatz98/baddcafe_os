@@ -1661,151 +1661,6 @@ still applies to code that lies.
 
 ---
 
-## Reference — files, commands, and how to read the machine
-
-This section is not a journal entry. It is the lookup table: every configuration file
-we have, every command worth remembering, and how to decode what the machine shows us.
-Unlike the numbered steps, **this section may be edited and kept current**.
-
-### R1. The configuration files, and why each one exists
-
-Four files configure this project. None of them contain kernel logic; together they are
-the reason `cargo build` produces something a bare machine can run.
-
-#### `rust-toolchain.toml` — which compiler
-
-```toml
-[toolchain]
-channel = "nightly"
-components = ["rust-src", "llvm-tools-preview"]
-```
-
-`rustup` reads this whenever a cargo command runs inside this directory and switches to
-the named toolchain automatically. Nobody has to remember `+nightly`.
-
-Nightly is not a preference. Two things we depend on are unstable: `-Z build-std`
-(recompiling the standard library for a target that has no prebuilt copy) and
-`.json` target specifications. Stable `rustc` refuses both.
-
-- `rust-src` ships the *source code* of `core`, so `build-std` has something to compile.
-- `llvm-tools-preview` ships `llvm-objcopy`, the tool `bootimage` uses to glue the
-  bootloader and the kernel into one disk image.
-
-#### `Cargo.toml` — the package
-
-```toml
-[package]
-name = "baddcafe_os"
-version = "0.1.0"
-edition = "2024"
-
-[package.metadata.bootimage]
-run-args = ["-serial", "stdio"]
-test-args = [
-    "-device", "isa-debug-exit,iobase=0xf4,iosize=0x04",
-    "-serial", "stdio",
-    "-display", "none",
-]
-test-success-exit-code = 33
-
-[[test]]
-name = "stack_overflow"
-harness = false
-
-[[test]]
-name = "page_fault"
-harness = false
-
-[[test]]
-name = "page_fault_protection"
-harness = false
-
-[dependencies]
-bootloader = "0.9.35"
-spin = "0.12.3"
-
-[profile.dev]
-panic = "abort"
-
-[profile.release]
-panic = "abort"
-```
-
-- `edition = "2024"` — the newest Rust edition. It is why we write
-  `#[unsafe(no_mangle)]` where the blog writes `#[no_mangle]`.
-- `panic = "abort"` on **both** profiles — by default a Rust panic *unwinds* the stack,
-  running destructors on the way out. Unwinding is implemented in libstd on top of
-  libunwind, which is C library code we no longer link. With `abort`, a panic simply
-  stops. Both profiles need it, because a build in either mode would otherwise ask for
-  the missing unwinder.
-- `bootloader = "0.9.35"` — a dependency our source never `use`s. It is here so that
-  `bootimage`, an external tool, can read the manifest and learn which bootloader
-  version to build. Cargo warns `unused dependency`; the warning is wrong for our case.
-- The `[[test]]` tables — each is an integration test that is a whole kernel of its own. `harness = false` means cargo does not look for `#[test]`
-  functions in it and simply runs its `_start`; the test either exits QEMU itself or
-  fails. They exist because a test whose handler ends the session cannot return to a
-  shared test runner.
-- `spin = "0.12.3"` — a spinlock. There is no operating system to put a waiting thread
-  to sleep, so a contended lock loops instead. Used for the global `WRITER` and `SERIAL`.
-- `[package.metadata.bootimage]` — cargo ignores this table; `bootimage` reads it.
-  `run-args` and `test-args` are appended to the QEMU command line for `cargo run` and
-  `cargo test`. `test-success-exit-code = 33` is `(0x10 << 1) | 1`: the status QEMU
-  produces when the kernel writes `QemuExitCode::Success` to the `isa-debug-exit` port.
-  Without it every test run would look like a failure, because that device's status is
-  always odd.
-
-#### `.cargo/config.toml` — how cargo behaves in this directory
-
-```toml
-[build]
-target = "x86_64-baddcafe_os.json"
-
-[unstable]
-build-std = ["core", "compiler_builtins"]
-build-std-features = ["compiler-builtins-mem"]
-json-target-spec = true
-panic-abort-tests = true
-
-[target.'cfg(target_os = "none")']
-runner = "bootimage runner"
-```
-
-- `build.target` — always cross-compile for our own target, so plain `cargo build` does
-  the right thing without flags.
-- `build-std` — for a target rustc has never heard of, no precompiled `core` exists, so
-  cargo compiles `core` and `compiler_builtins` from source alongside our crate.
-- `build-std-features = ["compiler-builtins-mem"]` — the compiler emits calls to
-  `memcpy`, `memset` and `memcmp` for ordinary things like assigning a struct. Normally
-  libc provides them. There is no libc here, so `compiler_builtins` must provide them.
-- `json-target-spec = true` — custom `.json` targets are gated behind their own
-  unstable flag on current nightly. Without it: *"`.json` target specs require
-  -Zjson-target-spec"*.
-- `panic-abort-tests = true` — cargo builds test targets under the `test` profile and
-  by default forces `panic = "unwind"` there, because the std test harness catches a
-  panicking test. That contradicts `panic = "abort"` everywhere else, and under
-  `build-std` it makes cargo compile a **second** `core`, which then collides with the
-  first over lang items. See Step 7.
-- `runner` — cargo cannot execute our binary; it is not a Linux program. This key says
-  "instead of running it, hand it to `bootimage runner`", which builds the disk image
-  and launches QEMU. That is what makes `cargo run` work.
-
-#### `x86_64-baddcafe_os.json` — the machine we are compiling for
-
-A **target specification** is data describing the machine: pointer width, endianness,
-which linker, what the operating system is. `rustc` is a cross-compiler by default; a
-target is just a description it reads, not a separate build of the compiler.
-
-| Field | Why |
-|---|---|
-| `"llvm-target": "x86_64-unknown-none"` | What LLVM is told to generate code for. `unknown` vendor, `none` OS. |
-| `"data-layout"` | Sizes and alignments of every primitive type, in LLVM's notation. Copied verbatim from the built-in `x86_64-unknown-none`. |
-| `"os": "none"` | **The critical one.** It is what stops the linker from adding the C runtime startup object. That object defines its own `_start`, which collided with ours in Step 2. |
-| `"linker-flavor": "ld.lld"`, `"linker": "rust-lld"` | Use the LLVM linker shipped with Rust, instead of the host's `cc`. The host linker builds Linux programs; we are not building one. |
-| `"panic-strategy": "abort"` | Same reason as in `Cargo.toml`: no unwinder exists. |
-| `"disable-redzone": true` | The **red zone** is 128 bytes below the stack pointer that a function may use without reserving them, because on Linux nothing can touch that memory. In a kernel an interrupt can fire at any instruction and pushes onto the same stack — silently destroying the red zone. It must be off. |
-| `"features": "-mmx,-sse,+soft-float"` | Disable the SIMD units. SIMD registers are large; saving and restoring them on every interrupt is expensive, and enabling SSE properly requires setup we have not done. `soft-float` makes the compiler emulate floating point in ordinary integer instructions. |
-| `"rustc-abi": "softfloat"` | Turning off SSE changes how floats are *passed to functions* — the normal x86-64 ABI passes them in `xmm` registers, which we just disabled. Modern rustc refuses to let the feature and the ABI disagree silently, so the target must say so explicitly. |
-
 ## Step 13 — Reading the page tables the bootloader left us
 
 **Goal.** Stop guessing at mappings from the outside. Walk the same four-level
@@ -2037,22 +1892,415 @@ ever colliding with a table frame the bootloader is still using to keep *us* run
 
 ---
 
+## Step 14 — A heap: `Box`, `Vec` and `String` on bare metal
+
+**Goal.** Give the kernel dynamic memory: a region of virtual addresses backed by real
+frames, and a global allocator over it, so `alloc::boxed::Box`, `Vec`, `String` and
+`format!` work exactly as they do in ordinary Rust.
+
+**Concept.** Until now every byte the kernel used had a size known at compile time: a
+`static`, or a local on the stack. A *heap* is memory whose size and lifetime are
+decided at run time — "give me 4000 bytes, I will tell you when I am done". In
+ordinary Rust, `std` gets that memory from the operating system (`mmap`/`brk` on
+Linux, through libc's `malloc`). We are the operating system, so three pieces have to
+exist before a single `Box::new` can work:
+
+1. **The `alloc` crate itself.** Rust's library is split in three layers: `core`
+   (needs nothing — no memory, no OS), `alloc` (needs only an allocator: `Box`, `Vec`,
+   `String`, `Rc`, `BTreeMap`), and `std` (needs a whole OS: files, threads, sockets).
+   We have been on `core` alone since Step 1. `alloc` is the layer we can now afford.
+   It has no prebuilt copy for our custom target, so `build-std` must compile it, just
+   as it compiles `core`.
+2. **Memory behind the addresses.** A virtual address range is useless until every
+   page in it is mapped to a frame. Step 13 built exactly the two tools for this:
+   `frame_allocator()` hands out unused physical frames, `create_mapping` wires a page
+   to one.
+3. **An allocator — the bookkeeping.** Something has to answer "where do these N bytes,
+   aligned to A, go?" and "this block is free again". Rust's contract for that is the
+   `GlobalAlloc` trait: `alloc(Layout) -> *mut u8` and `dealloc(*mut u8, Layout)`. A
+   `Layout` is a size plus an alignment (a power of two). Returning a null pointer
+   means "out of memory"; Rust then calls the allocation-error handler, which in
+   `no_std` defaults to a panic (`memory allocation of N bytes failed`). The
+   `#[global_allocator]` attribute on one `static` tells the compiler "every `Box`,
+   `Vec` and `String` in the program goes through this one".
+
+The simplest correct design is a **bump allocator**: keep a pointer `next` to the
+first free byte; to allocate, round `next` up to the requested alignment, hand that
+address out, and move `next` past the block. Freeing a single block does nothing,
+because there is no record of where blocks are. A counter of live allocations lets one
+case still work: when it drops to zero, *nothing* is in use, so `next` can jump back
+to the start. Allocation is a handful of instructions; the price is that one
+long-lived allocation pins the whole heap forever. Better designs are the next step.
+
+**What we did.**
+
+*Build configuration.* `.cargo/config.toml`:
+
+```toml
+build-std = ["core", "compiler_builtins", "alloc"]
+```
+
+*A bug in Step 13, found before it could bite.* `memory::frame_allocator()` built a
+brand new `FrameAllocator { next: 0, .. }` on every call. Two callers — the heap
+setup and the probe-mapping test — would each have started from frame 0 of the
+memory map and received **the same physical frames**: two virtual pages silently
+aliasing one piece of RAM, each overwriting the other. It never showed up because only
+one caller existed. Now there is exactly one allocator for the whole kernel, built in
+`memory::init` and kept behind a lock:
+
+```rust
+static FRAME_ALLOCATOR: Once<Mutex<FrameAllocator>> = Once::new();
+
+pub fn frame_allocator() -> MutexGuard<'static, FrameAllocator> { .. }
+```
+
+Callers hold the guard while they map, and pass `&mut guard` where a
+`&mut FrameAllocator` is expected — the compiler turns one into the other through
+`DerefMut` (*deref coercion*), so the call sites barely changed.
+
+*`create_mapping` made stricter.* It now takes the leaf flags as a parameter and
+returns `Result<(), MapError>` instead of panicking or silently overwriting:
+
+| `MapError` | When |
+|---|---|
+| `Unaligned` | `virt` or `frame` not a multiple of 4096 |
+| `AlreadyMapped` | the leaf entry is already present — the old version would have overwritten it, leaking or aliasing whatever was there |
+| `InsideHugePage` | an intermediate entry is a 2 MiB/1 GiB page, so there is no table below it; the old version would have read the huge frame's *data* as if it were a page table |
+| `OutOfFrames` | no frame left for a missing intermediate table |
+
+A new flag, `NO_EXECUTE` (bit 63 of an entry). The bootloader turns on `EFER.NXE`
+(Extended Feature Enable Register, No-eXecute Enable — read in
+`bootloader-0.9.35/src/main.rs`, `enable_nxe_bit()`); without NXE, bit 63 is
+*reserved* and setting it makes every access to that page fault. Intermediate tables
+never get it: the CPU combines the permissions of all four levels, so an NX on a PML4
+entry would forbid execution for 512 GiB at once.
+
+*`src/allocator.rs`, new:*
+
+- `HEAP_START = 0x4444_4444_0000`, `HEAP_SIZE = 1 MiB` — an arbitrary, recognisable
+  address in an otherwise empty part of the address space. Because `create_mapping`
+  now refuses to map over anything already present, a collision would be an error at
+  boot, not quiet corruption.
+- `init_heap()` maps the 256 pages, each `WRITABLE | NO_EXECUTE`, then hands the range
+  to the allocator. A second call fails with `AlreadyMapped` before touching the
+  allocator, so the range can only ever be handed over once.
+- `BumpAllocator { heap_start, heap_end, next, allocations }`. All arithmetic is
+  checked: `align_up` and `start + size` return `None` (→ null pointer) on overflow
+  instead of wrapping around to a small address that would land on top of the kernel.
+  An allocator that was never `init`ed has `heap_end == 0` and refuses everything —
+  a clean panic, not a write to address 0.
+- `Locked<A>`, a wrapper around `spin::Mutex<A>`, and
+  `unsafe impl GlobalAlloc for Locked<BumpAllocator>`. Every lock is taken inside
+  `idt::without_interrupts`.
+
+*Callers.* `_start` in `src/main.rs`, in the library's test kernel, and in the new
+integration tests: `init()` → `memory::init(boot_info)` →
+`allocator::init_heap().expect(..)`. The banner now prints a `Vec` and a `Box`.
+
+*Tests.* Four new library cases — `mapping_the_same_page_twice_is_refused`, and three
+pure-logic tests of `BumpAllocator` (alignment and reclaim, refusing what does not fit,
+never wrapping around) that run it over made-up addresses, since the bump logic never
+touches the memory it hands out. Two new integration kernels:
+
+- `tests/heap_allocation.rs` — the first integration test using our test *runner*
+  (`custom_test_frameworks`) instead of `harness = false`, seven cases: the range is
+  mapped end to end and not one byte further, a second `init_heap` is refused, `Box`
+  and a 1000-element `Vec` land inside the heap range, `format!`/`String` work, a
+  `#[repr(align(4096))]` value really comes back page-aligned, and 2 MiB worth of
+  short-lived boxes fit in a 1 MiB heap (only possible if freeing rewinds `next`).
+- `tests/heap_no_execute.rs` — writes a single `ret` instruction (`0xc3`) into a
+  `Box`, turns the pointer into a function pointer, and calls it. The handler asserts
+  that `CR2` is the box's address and that the error code has bit 0 (present) and
+  bit 4 (instruction fetch) set and bit 1 (write) clear.
+
+**What happened.**
+
+The first build failed on the banner, through a mistake in formatting, not in memory:
+
+```
+error[E0277]: the trait bound `Box<u64>: LowerHex` is not satisfied
+  --> src/main.rs:60:52
+   |
+60 |     println!("Heap: {:?}, {:#x} at {:p}", squares, boxed, boxed);
+   |                           -----                    ^^^^^ the trait `LowerHex` is not implemented for `Box<u64>`
+```
+
+`Box<T>` forwards `Display` and `Debug` to `T`, but not `LowerHex`; `{:#x}` needs the
+`u64` itself, so it became `*boxed`. `{:p}` on the `Box` itself prints the address.
+
+Clippy flagged one new line, with a nightly-era suggestion:
+
+```
+warning: manual implementation of `.is_multiple_of()`
+208 |     if virt % PAGE_SIZE != 0 || frame % PAGE_SIZE != 0 {
+    |        ^^^^^^^^^^^^^^^^^^^^^ help: replace with: `!virt.is_multiple_of(PAGE_SIZE)`
+```
+
+Taken. Every other clippy warning in the crate predates this step.
+
+`cargo test`, all five kernels:
+
+```
+Running 11 tests
+baddcafe_os::a_freshly_created_mapping_is_readable_and_writable... [ok]
+...
+baddcafe_os::bump_allocator_aligns_and_reclaims... [ok]
+baddcafe_os::bump_allocator_never_wraps_around... [ok]
+baddcafe_os::bump_allocator_refuses_what_does_not_fit... [ok]
+...
+baddcafe_os::mapping_the_same_page_twice_is_refused... [ok]
+...
+Running 7 tests
+heap_allocation::box_lives_on_the_heap... [ok]
+heap_allocation::freed_memory_is_reused... [ok]
+heap_allocation::heap_is_mapped_end_to_end... [ok]
+heap_allocation::large_vec_grows_and_keeps_its_contents... [ok]
+heap_allocation::over_aligned_allocation_is_honoured... [ok]
+heap_allocation::second_init_is_refused... [ok]
+heap_allocation::string_formatting_allocates... [ok]
+heap_no_execute::jump_into_heap... [ok]
+page_fault::write_to_unmapped_page... [ok]
+page_fault_protection::write_to_executable_page... [ok]
+stack_overflow::double_fault_survives_stack_overflow... [ok]
+```
+
+22 tests, exit 0, in both `cargo test` and `cargo test --release`.
+
+A passing test proves nothing until it has been seen to fail. With `NO_EXECUTE`
+temporarily removed from `init_heap`, the NX test fails exactly as it should — the CPU
+happily fetched and ran the `ret` from the heap and returned:
+
+```
+heap_no_execute::jump_into_heap... [failed]
+panicked at tests/heap_no_execute.rs:45:5:
+executed an instruction fetched from the heap
+```
+
+The production kernel, booted headless and its screen read back with `pmemsave`:
+
+```
+...and we came back from the exception.
+Heap: [1, 4, 9, 16, 25, 36, 49, 64], 0xbaddcafe at 0x444444440040
+Timer and keyboard interrupts are on. Type:
+```
+
+`0x444444440040` is the bump allocator showing its work: the `Vec` of eight `u64`s
+took the first 64 (`0x40`) bytes of the heap, and the `Box` landed directly after it.
+
+**Why.** `Box::new` compiles to a call to `__rust_alloc`, which `#[global_allocator]`
+resolves to our `ALLOCATOR.alloc`. That returns an address in the heap range; the
+first write through it goes to the MMU (Memory Management Unit), which walks the four
+tables `init_heap` built and finds a present, writable leaf. Nothing about `Box` is
+special to the kernel — it is just memory, and every piece of the path from a type
+in `alloc` to an address line is now code we wrote.
+
+Why interrupts are off while the allocator lock is held: we have one CPU and a spin
+lock. If the kernel holds the lock inside `alloc` and the timer fires, and the
+handler allocates, the handler spins waiting for a lock that only the interrupted code
+can release — and that code cannot run until the handler returns. A deadlock with no
+second party. No handler allocates today; turning interrupts off makes that a
+non-question rather than a rule someone has to remember. The frame allocator's lock
+has the same hazard and is documented as off-limits to handlers instead, because it
+is only used at boot.
+
+**Rust concepts touched.**
+
+- **The `core` / `alloc` / `std` split** — `extern crate alloc;` is still required in
+  edition 2024 for crates the compiler does not link implicitly, which in `no_std` is
+  everything except `core`.
+- **`unsafe trait`** — `GlobalAlloc` is declared `unsafe trait`, so implementing it is
+  `unsafe impl`: the *implementer* promises the compiler something it cannot check
+  (every pointer returned is valid for the `Layout` and not handed out twice). That is
+  the opposite direction from an `unsafe fn`, where the *caller* makes the promise.
+  `BumpAllocator::init` is the latter: its caller promises the range is mapped and
+  unused.
+- **Interior mutability through a lock** — `GlobalAlloc::alloc` takes `&self`, because
+  the global allocator is a shared `static`; mutation goes through the `Mutex`.
+- **The orphan rule** — a trait can only be implemented for a type if the trait or the
+  type is defined in our crate. `GlobalAlloc` (in `core`) and `spin::Mutex` (in
+  `spin`) are both foreign, which is why `Locked<A>` exists at all.
+- **Deref coercion** — `&mut MutexGuard<FrameAllocator>` passing as
+  `&mut FrameAllocator`.
+- **`Result` and `?` replacing panics** — `create_mapping` errors are values the caller
+  decides about; `init_heap` forwards them with `?`, and only `_start` chooses to
+  `expect`.
+- **`let … else`** — `let Some(start) = align_up(..) else { return null };` binds on
+  success and forces the failure branch to diverge.
+- **Checked arithmetic** — `checked_add`/`checked_sub` return `Option`, the honest
+  type for "this might not fit in 64 bits"; plain `+` panics on overflow in debug
+  builds and silently wraps in release builds.
+
+---
+
+## Reference — files, commands, and how to read the machine
+
+This section is not a journal entry. It is the lookup table: every configuration file
+we have, every command worth remembering, and how to decode what the machine shows us.
+Unlike the numbered steps, **this section may be edited and kept current**.
+
+### R1. The configuration files, and why each one exists
+
+Four files configure this project. None of them contain kernel logic; together they are
+the reason `cargo build` produces something a bare machine can run.
+
+#### `rust-toolchain.toml` — which compiler
+
+```toml
+[toolchain]
+channel = "nightly"
+components = ["rust-src", "llvm-tools-preview"]
+```
+
+`rustup` reads this whenever a cargo command runs inside this directory and switches to
+the named toolchain automatically. Nobody has to remember `+nightly`.
+
+Nightly is not a preference. Two things we depend on are unstable: `-Z build-std`
+(recompiling the standard library for a target that has no prebuilt copy) and
+`.json` target specifications. Stable `rustc` refuses both.
+
+- `rust-src` ships the *source code* of `core`, so `build-std` has something to compile.
+- `llvm-tools-preview` ships `llvm-objcopy`, the tool `bootimage` uses to glue the
+  bootloader and the kernel into one disk image.
+
+#### `Cargo.toml` — the package
+
+```toml
+[package]
+name = "baddcafe_os"
+version = "0.1.0"
+edition = "2024"
+
+[package.metadata.bootimage]
+run-args = ["-serial", "stdio"]
+test-args = [
+    "-device", "isa-debug-exit,iobase=0xf4,iosize=0x04",
+    "-serial", "stdio",
+    "-display", "none",
+]
+test-success-exit-code = 33
+
+[[test]]
+name = "stack_overflow"
+harness = false
+
+[[test]]
+name = "page_fault"
+harness = false
+
+[[test]]
+name = "page_fault_protection"
+harness = false
+
+[dependencies]
+bootloader = "0.9.35"
+spin = "0.12.3"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+```
+
+- `edition = "2024"` — the newest Rust edition. It is why we write
+  `#[unsafe(no_mangle)]` where the blog writes `#[no_mangle]`.
+- `panic = "abort"` on **both** profiles — by default a Rust panic *unwinds* the stack,
+  running destructors on the way out. Unwinding is implemented in libstd on top of
+  libunwind, which is C library code we no longer link. With `abort`, a panic simply
+  stops. Both profiles need it, because a build in either mode would otherwise ask for
+  the missing unwinder.
+- `bootloader = "0.9.35"` — a dependency our source never `use`s. It is here so that
+  `bootimage`, an external tool, can read the manifest and learn which bootloader
+  version to build. Cargo warns `unused dependency`; the warning is wrong for our case.
+- The `[[test]]` tables — each is an integration test that is a whole kernel of its own. `harness = false` means cargo does not look for `#[test]`
+  functions in it and simply runs its `_start`; the test either exits QEMU itself or
+  fails. They exist because a test whose handler ends the session cannot return to a
+  shared test runner.
+- `spin = "0.12.3"` — a spinlock. There is no operating system to put a waiting thread
+  to sleep, so a contended lock loops instead. Used for the global `WRITER` and `SERIAL`.
+- `[package.metadata.bootimage]` — cargo ignores this table; `bootimage` reads it.
+  `run-args` and `test-args` are appended to the QEMU command line for `cargo run` and
+  `cargo test`. `test-success-exit-code = 33` is `(0x10 << 1) | 1`: the status QEMU
+  produces when the kernel writes `QemuExitCode::Success` to the `isa-debug-exit` port.
+  Without it every test run would look like a failure, because that device's status is
+  always odd.
+
+#### `.cargo/config.toml` — how cargo behaves in this directory
+
+```toml
+[build]
+target = "x86_64-baddcafe_os.json"
+
+[unstable]
+build-std = ["core", "compiler_builtins", "alloc"]
+build-std-features = ["compiler-builtins-mem"]
+json-target-spec = true
+panic-abort-tests = true
+
+[target.'cfg(target_os = "none")']
+runner = "bootimage runner"
+```
+
+- `build.target` — always cross-compile for our own target, so plain `cargo build` does
+  the right thing without flags.
+- `build-std` — for a target rustc has never heard of, no precompiled `core` exists, so
+  cargo compiles `core` and `compiler_builtins` from source alongside our crate.
+  `alloc` (`Box`, `Vec`, `String`) is in the list since Step 14, when the kernel got a
+  heap; it is the layer between `core` and `std` that needs an allocator but no OS.
+- `build-std-features = ["compiler-builtins-mem"]` — the compiler emits calls to
+  `memcpy`, `memset` and `memcmp` for ordinary things like assigning a struct. Normally
+  libc provides them. There is no libc here, so `compiler_builtins` must provide them.
+- `json-target-spec = true` — custom `.json` targets are gated behind their own
+  unstable flag on current nightly. Without it: *"`.json` target specs require
+  -Zjson-target-spec"*.
+- `panic-abort-tests = true` — cargo builds test targets under the `test` profile and
+  by default forces `panic = "unwind"` there, because the std test harness catches a
+  panicking test. That contradicts `panic = "abort"` everywhere else, and under
+  `build-std` it makes cargo compile a **second** `core`, which then collides with the
+  first over lang items. See Step 7.
+- `runner` — cargo cannot execute our binary; it is not a Linux program. This key says
+  "instead of running it, hand it to `bootimage runner`", which builds the disk image
+  and launches QEMU. That is what makes `cargo run` work.
+
+#### `x86_64-baddcafe_os.json` — the machine we are compiling for
+
+A **target specification** is data describing the machine: pointer width, endianness,
+which linker, what the operating system is. `rustc` is a cross-compiler by default; a
+target is just a description it reads, not a separate build of the compiler.
+
+| Field | Why |
+|---|---|
+| `"llvm-target": "x86_64-unknown-none"` | What LLVM is told to generate code for. `unknown` vendor, `none` OS. |
+| `"data-layout"` | Sizes and alignments of every primitive type, in LLVM's notation. Copied verbatim from the built-in `x86_64-unknown-none`. |
+| `"os": "none"` | **The critical one.** It is what stops the linker from adding the C runtime startup object. That object defines its own `_start`, which collided with ours in Step 2. |
+| `"linker-flavor": "ld.lld"`, `"linker": "rust-lld"` | Use the LLVM linker shipped with Rust, instead of the host's `cc`. The host linker builds Linux programs; we are not building one. |
+| `"panic-strategy": "abort"` | Same reason as in `Cargo.toml`: no unwinder exists. |
+| `"disable-redzone": true` | The **red zone** is 128 bytes below the stack pointer that a function may use without reserving them, because on Linux nothing can touch that memory. In a kernel an interrupt can fire at any instruction and pushes onto the same stack — silently destroying the red zone. It must be off. |
+| `"features": "-mmx,-sse,+soft-float"` | Disable the SIMD units. SIMD registers are large; saving and restoring them on every interrupt is expensive, and enabling SSE properly requires setup we have not done. `soft-float` makes the compiler emulate floating point in ordinary integer instructions. |
+| `"rustc-abi": "softfloat"` | Turning off SSE changes how floats are *passed to functions* — the normal x86-64 ABI passes them in `xmm` registers, which we just disabled. Modern rustc refuses to let the feature and the ABI disagree silently, so the target must say so explicitly. |
+
 ### R2. Commands
 
 #### Source layout
 
 ```
-src/main.rs        `_start`, the panic handlers, the module declarations, the
-                   custom test runner, the Testable trait, and exit_qemu
+src/main.rs        the kernel's `_start`, the banner, the panic handlers
+src/lib.rs         module list, init(), hlt_loop, exit_qemu, the test runner and
+                   the library's own test kernel and test cases
 src/vga_buffer.rs  the VGA text buffer: Color, ColorCode, ScreenChar, Writer,
                    the global WRITER, and the print!/println! macros
-src/idt.rs         the Interrupt Descriptor Table: Entry, Idt, InterruptStackFrame,
-                   the breakpoint handler, and init()
-src/memory.rs      the hand-rolled page-table walker: translate(), FrameAllocator,
-                   create_mapping(), through the bootloader's physical-memory offset
+src/serial.rs      the 16550 UART on COM1 and serial_print!/serial_println!
 src/port.rs        port-mapped I/O primitives: outb, outl, inb
-src/serial.rs      the 16550 UART on COM1: Serial, the global SERIAL, and the
-                   serial_print!/serial_println! macros
+src/gdt.rs         GDT, TSS and the double-fault stack
+src/idt.rs         the IDT, the exception and interrupt handlers, TICKS,
+                   without_interrupts
+src/pic.rs         the two 8259 PICs
+src/keyboard.rs    scancode set 1 decoding
+src/memory.rs      the page-table walker: translate(), the global frame allocator,
+                   create_mapping(), through the bootloader's physical-memory offset
+src/allocator.rs   the heap range, init_heap(), the bump allocator and the
+                   #[global_allocator]
+tests/*.rs         integration tests, each a whole kernel of its own
 ```
 
 #### Toolchain sanity
@@ -2298,31 +2546,33 @@ evidence that all three rungs were climbed before control reached `_start`.
 
 - Branch `master`. Committed: `75d458e` (steps 0-3), `d40df33` (step 4), `3fa414d`
   (steps 5-6), `ae7a1a8` (step 7), `da2a262` (step 8), `fd8bae1` (step 9), `d17b0df`
-  (steps 10-11), `905b84f` (step 12). Step 13 is uncommitted as of this entry.
+  (steps 10-11), `905b84f` (step 12), `e75713c` (step 13), then housekeeping
+  (`2693bb2`, `703dce8` README and license, `f565da1` `guides/` back in
+  `.gitignore`). Step 14 is uncommitted as of this entry.
 - Toolchain: nightly, pinned by `rust-toolchain.toml`, with `rust-src` and
-  `llvm-tools-preview`. This session ran on a different, fresh machine than earlier
-  ones (see Step 13's environment note); the exact nightly snapshot it picked up was
-  newer (`1.101.0-nightly`, 2026-10-04) than the one steps 0-12 were built with
-  (`1.100.0-nightly`, 2026-09-03) — expected, since the toolchain file pins a channel,
-  not a date, and no drift was hit this time.
+  `llvm-tools-preview`. Step 14 was built on the Linux host again, on
+  `1.100.0-nightly` (2026-09-03); Step 13 ran on Windows on `1.101.0-nightly`. The
+  file pins a channel, not a date, so each machine keeps whatever snapshot it has.
 - Edition 2024. `panic = "abort"` on both profiles, `panic-abort-tests = true`.
-  Unstable features in use: `custom_test_frameworks`, `abi_x86_interrupt`.
+  `build-std = ["core", "compiler_builtins", "alloc"]`. Unstable features in use:
+  `custom_test_frameworks`, `abi_x86_interrupt`.
 - Dependencies: `bootloader = { version = "0.9.35", features = ["map_physical_memory"] }`
-  (now actually `use`d, for `BootInfo`, not just read by `bootimage`) and
-  `spin = "0.12.3"` (`Mutex` behind `WRITER`/`SERIAL`/`KEYBOARD`, `Once` behind the
-  `IDT`, the `GDT`, the `TSS`, each test kernel's own IDT, and now `memory`'s offset
-  and memory-map globals).
+  and `spin = "0.12.3"` (`Mutex` behind `WRITER`/`SERIAL`/`KEYBOARD`, the frame
+  allocator and the heap allocator; `Once` behind the `IDT`, the `GDT`, the `TSS`, each
+  test kernel's own IDT, and `memory`'s globals).
 - The crate is a library plus a binary:
-  - `src/lib.rs` — modules, `init()` (serial → GDT → IDT → PIC → `sti`), `hlt_loop()`,
-    `QemuExitCode`, `exit_qemu`, `Testable`, `test_runner`, `test_panic_handler`, and a
-    `#[cfg(test)]` `_start(boot_info: &'static BootInfo)`/panic handler for the
-    library's own test kernel. Seven test cases live here.
-  - `src/main.rs` — `_start(boot_info: &'static BootInfo)`, the banner, the two panic
-    handlers split on `cfg(test)`.
-  - `tests/stack_overflow.rs`, `tests/page_fault.rs`,
-    `tests/page_fault_protection.rs` — three separate kernels, `harness = false`,
-    still with a zero-argument `_start`; they never needed `boot_info` and the
-    bootloader does not mind it going unread.
+  - `src/lib.rs` — modules, `extern crate alloc`, `init()` (serial → GDT → IDT → PIC →
+    `sti`), `hlt_loop()`, `QemuExitCode`, `exit_qemu`, `Testable`, `test_runner`,
+    `test_panic_handler`, and a `#[cfg(test)]` `_start` that also sets up the heap.
+    Eleven test cases live here.
+  - `src/main.rs` — `_start(boot_info)`: `init()` → `memory::init` →
+    `allocator::init_heap` → banner (which now prints a `Vec` and a `Box`).
+  - `tests/stack_overflow.rs`, `tests/page_fault.rs`, `tests/page_fault_protection.rs`
+    — `harness = false`, zero-argument `_start`, unchanged.
+  - `tests/heap_allocation.rs` — seven cases through our own test runner, with a
+    `BootInfo`-taking `_start` that sets up the heap.
+  - `tests/heap_no_execute.rs` — `harness = false`; jumps into the heap and expects an
+    instruction-fetch page fault.
 - `src/gdt.rs`: `Tss` (`repr(C, packed(4))`), a 20 KiB `UnsafeCell` stack for the
   double-fault handler, an eight-slot `Gdt` with a null descriptor, a ring-0 code
   segment and a 16-byte TSS descriptor, `lgdt`, a `retfq` trampoline to reload `cs`,
@@ -2333,10 +2583,14 @@ evidence that all three rungs were climbed before control reached `_start`.
   and keyboard (33), the `PageFaultErrorCode` newtype, `read_cr2`, a `TICKS` counter,
   and `enable`/`disable`/`are_enabled`/`without_interrupts`.
 - `src/memory.rs`: the hand-written page-table walker — `Entry`, `Table`
-  (`repr(C, align(4096))`), `translate()` (handles 2 MiB/1 GiB huge pages), a
-  from-scratch `FrameAllocator` over `BootInfo`'s memory map, and
-  `create_mapping()`, all reached through the bootloader's physical-memory-offset
-  mapping (`table_at`/`table_at_mut`). No `x86_64` crate.
+  (`repr(C, align(4096))`), `translate()` (handles 2 MiB/1 GiB huge pages), a single
+  global `FrameAllocator` behind `frame_allocator() -> MutexGuard<..>`, and
+  `create_mapping(virt, frame, flags, allocator) -> Result<(), MapError>` with public
+  `WRITABLE` and `NO_EXECUTE` flags. All reached through the bootloader's
+  physical-memory-offset mapping. No `x86_64` crate.
+- `src/allocator.rs`: `HEAP_START = 0x4444_4444_0000`, `HEAP_SIZE = 1 MiB`,
+  `init_heap()`, `BumpAllocator` with checked arithmetic, `Locked<A>`, and the
+  `#[global_allocator]`, locked with interrupts off.
 - `src/pic.rs`: the two 8259s remapped to 32-47, all lines masked except timer,
   keyboard and the cascade, plus `end_of_interrupt` and `io_wait`.
 - `src/keyboard.rs`: scancode set 1 decoded through two 0x40-entry `char` tables, with
@@ -2344,47 +2598,48 @@ evidence that all three rungs were climbed before control reached `_start`.
 - `src/vga_buffer.rs`: the `Writer`, plus backspace, hardware cursor updates through
   ports 0x3D4/0x3D5, and `_print` wrapped in `without_interrupts`. `src/serial.rs`
   likewise.
-- **`cargo run` boots and the keyboard types on the screen. `cargo test` runs ten
-  tests across four kernels and exits 0.** Verified: seven library tests (four from
-  before, plus `vga_buffer_is_identity_mapped`, `kernel_code_is_mapped_but_not_identity`
-  and `a_freshly_created_mapping_is_readable_and_writable`), plus `stack_overflow`,
-  `page_fault` and `page_fault_protection` unchanged.
-- Warnings we are knowingly carrying: cargo's kebab-case binary-name suggestion, and
-  the future-incompatibility report about nightly's own `core` sources. The
-  `unused dependency: bootloader` warning carried since Step 4 is gone — the crate is
-  `use`d for real now.
+- **`cargo run` boots, prints from the heap, and the keyboard types on the screen.
+  `cargo test` runs 22 tests across six kernels and exits 0, in debug and in
+  `--release`.** Verified.
+- Warnings we are knowingly carrying: cargo's kebab-case binary-name suggestion, the
+  future-incompatibility report about nightly's own `core` sources, and older clippy
+  lints in `idt.rs`, `keyboard.rs`, `pic.rs` and `port.rs` (missing `Default`,
+  function-pointer casts, missing `# Safety` docs) that predate Step 14. Nothing new.
 - Known hazards:
+  - The bump allocator reclaims nothing until *every* allocation is freed. One
+    long-lived `Box` pins the heap, and after that each allocation is permanent.
+  - The heap is a fixed 1 MiB and cannot grow.
   - Only vectors 3, 8, 14, 32 and 33 are present. Any other exception still arrives as
-    a double fault, which now panics with a readable message but tells us nothing about
+    a double fault, which panics with a readable message but tells us nothing about
     the original cause.
   - The double-fault stack has no guard page. An overflow inside the handler itself
-    would silently corrupt whatever sits below it. A real guard page (present-bit
-    cleared, so overflowing into it page-faults instead of corrupting memory) is now
-    possible to build with `memory.rs`, but has not been done yet.
+    would silently corrupt whatever sits below it.
   - `keyboard_handler` prints directly from the interrupt handler. It cannot deadlock
     (every `WRITER` user disables interrupts), but the right design is a queue the
-    handler pushes to and normal code drains. That arrives with async/await.
+    handler pushes to and normal code drains. That arrives with async/await — and now
+    that a heap exists, the queue can be an allocated one.
   - Extended (0xE0) scancodes — arrows, right control, keypad — are decoded and thrown
     away.
-  - `FrameAllocator` re-walks the whole memory map on every `allocate_frame()` call —
-    correct, and explicitly a problem for the Allocator Designs step to improve, not
-    this one.
-  - `create_mapping` does not set the `NO_EXECUTE` bit on anything; every page it
-    creates is executable by default. Fine for a test mapping, not fine for a heap.
+  - `FrameAllocator` re-walks the whole memory map on every `allocate_frame()` call,
+    and freed frames are never returned.
+  - The frame-allocator lock must not be taken from an interrupt handler; this is
+    documented, not enforced.
 
 ## Next step
 
-**Heap allocation.**
+**Allocator designs.**
 
-With `memory::frame_allocator()` and `memory::create_mapping()` both proven correct,
-the pieces needed for a heap already exist: pick a fixed, currently-unused range of
-virtual addresses, call `create_mapping` for each page in it against a freshly
-allocated frame, and the kernel has a region of memory it is allowed to grow into.
+The bump allocator is correct but cannot reuse a block until the whole heap is free.
+The phil-opp track compares two replacements against it:
 
-What is still missing is turning that region into something `alloc::boxed::Box`,
-`Vec` and `String` can use: an `impl GlobalAlloc` registered with
-`#[global_allocator]`, which means deciding on an allocation strategy for the first
-time — even a minimal bump allocator has to track an allocation pointer and answer
-`alloc`/`dealloc` without ever corrupting its own bookkeeping. That one, simple design
-is this step's job; comparing it against better ones (linked-list, fixed-size block)
-is explicitly the step after.
+- a **linked-list allocator**, which threads a list of free regions *through the
+  free memory itself* (each free block stores its own size and a pointer to the next
+  one), so any freed block can be reused, at the cost of a list walk per allocation
+  and fragmentation over time;
+- a **fixed-size block allocator**, which keeps one free list per size class (8, 16,
+  32, … bytes) and serves most allocations in constant time.
+
+A good first move is a test that the bump allocator *fails*: one long-lived `Box`
+followed by more short-lived allocations than the heap can hold. It should run out
+of memory today and pass once a real free list exists. `Locked<A>` is already generic,
+so swapping the allocator should be a change to one `static`.

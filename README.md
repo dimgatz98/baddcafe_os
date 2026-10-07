@@ -11,10 +11,11 @@ numbered entry per step, with the real error output that each step ran into.
 
 Done: freestanding binary, custom target, bootable image, VGA text output, a test
 framework that exits QEMU by itself, CPU exceptions, double faults on their own stack,
-hardware interrupts (timer, keyboard), page fault handling, and paging (a hand-written
-page table walker and frame allocator).
+hardware interrupts (timer, keyboard), page fault handling, paging (a hand-written
+page table walker and frame allocator), and a heap with a bump allocator, so `Box`,
+`Vec` and `String` work.
 
-Next: heap allocation.
+Next: better allocator designs.
 
 ## Running it
 
@@ -39,6 +40,7 @@ cargo test    # build the test kernels, boot each one, exit with a pass/fail cod
 | `src/main.rs` | The kernel entry point and banner |
 | `src/lib.rs` | Shared init, the test runner and the library's own tests |
 | `src/memory.rs` | Page table walker, frame allocator, mapping creation |
+| `src/allocator.rs` | The kernel heap and its global allocator |
 | `src/idt.rs`, `src/gdt.rs`, `src/pic.rs` | Exceptions, segmentation, interrupt controller |
 | `src/vga_buffer.rs`, `src/serial.rs`, `src/keyboard.rs` | Screen, serial port, keyboard |
 | `tests/` | Integration tests, each a separate kernel |
