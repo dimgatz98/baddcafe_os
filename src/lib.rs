@@ -174,7 +174,7 @@ fn mapping_the_same_page_twice_is_refused() {
 
 #[test_case]
 fn bump_allocator_aligns_and_reclaims() {
-    use allocator::BumpAllocator;
+    use allocator::bump::BumpAllocator;
     use core::alloc::Layout;
 
     // Addresses only: the bump logic never touches the memory it hands out.
@@ -194,7 +194,7 @@ fn bump_allocator_aligns_and_reclaims() {
 
 #[test_case]
 fn bump_allocator_refuses_what_does_not_fit() {
-    use allocator::BumpAllocator;
+    use allocator::bump::BumpAllocator;
     use core::alloc::Layout;
 
     let mut bump = BumpAllocator::new();
@@ -208,11 +208,113 @@ fn bump_allocator_refuses_what_does_not_fit() {
 
 #[test_case]
 fn bump_allocator_never_wraps_around() {
-    use allocator::BumpAllocator;
+    use allocator::bump::BumpAllocator;
     use core::alloc::Layout;
 
     let mut bump = BumpAllocator::new();
     unsafe { bump.init(usize::MAX - 0x20, 0x20) };
     assert!(bump.alloc(Layout::from_size_align(1, 0x40).unwrap()).is_null());
     assert!(bump.alloc(Layout::from_size_align(usize::MAX / 2, 1).unwrap()).is_null());
+}
+
+/// Real memory for allocators that write their bookkeeping into the blocks they
+/// manage. Leaked from the kernel heap, so it stays valid for the `'static` free
+/// lists that point into it.
+#[cfg(test)]
+fn leaked_arena(bytes: usize) -> usize {
+    alloc::vec![0u64; bytes / 8].leak().as_mut_ptr() as usize
+}
+
+#[test_case]
+fn linked_list_reuses_a_freed_block() {
+    use allocator::linked_list::LinkedListAllocator;
+    use core::alloc::Layout;
+
+    let mut list = LinkedListAllocator::new();
+    unsafe { list.init(leaked_arena(256), 256) };
+
+    let layout = Layout::from_size_align(16, 8).unwrap();
+    let a = list.alloc(layout);
+    let b = list.alloc(layout);
+    assert!(!a.is_null() && !b.is_null());
+    assert_ne!(a, b);
+
+    unsafe { list.dealloc(a, layout) };
+    assert_eq!(list.alloc(layout), a);
+}
+
+#[test_case]
+fn linked_list_refuses_what_does_not_fit() {
+    use allocator::linked_list::LinkedListAllocator;
+    use core::alloc::Layout;
+
+    let mut list = LinkedListAllocator::new();
+    assert!(list.alloc(Layout::from_size_align(1, 1).unwrap()).is_null());
+
+    let arena = leaked_arena(256);
+    unsafe { list.init(arena, 256) };
+    assert!(list.alloc(Layout::from_size_align(257, 1).unwrap()).is_null());
+    // Fits, but would leave 8 bytes: too few to hold a free-list node.
+    assert!(list.alloc(Layout::from_size_align(248, 8).unwrap()).is_null());
+
+    let whole = Layout::from_size_align(256, 8).unwrap();
+    let p = list.alloc(whole);
+    assert_eq!(p as usize, arena);
+    assert!(list.alloc(Layout::from_size_align(1, 1).unwrap()).is_null());
+
+    unsafe { list.dealloc(p, whole) };
+    assert_eq!(list.alloc(whole) as usize, arena);
+}
+
+#[test_case]
+fn linked_list_keeps_the_alignment_padding() {
+    use allocator::linked_list::LinkedListAllocator;
+    use core::alloc::Layout;
+
+    let mut list = LinkedListAllocator::new();
+    let base = (leaked_arena(1024) + 255) / 256 * 256 + 8;
+    unsafe { list.init(base, 248 + 16) };
+
+    let p = list.alloc(Layout::from_size_align(16, 256).unwrap());
+    assert_eq!(p as usize, base + 248);
+    let gap = list.alloc(Layout::from_size_align(248, 8).unwrap());
+    assert_eq!(gap as usize, base, "padding before an aligned block was lost");
+    assert!(list.alloc(Layout::from_size_align(8, 8).unwrap()).is_null());
+}
+
+#[test_case]
+fn linked_list_never_leaves_a_gap_too_small_for_a_node() {
+    use allocator::linked_list::LinkedListAllocator;
+    use core::alloc::Layout;
+
+    let mut list = LinkedListAllocator::new();
+    let base = (leaked_arena(512) + 63) / 64 * 64 + 56;
+    unsafe { list.init(base, 256) };
+
+    // The nearest 64-byte boundary is 8 bytes away, too few for a node, so the
+    // block moves to the one after it.
+    let p = list.alloc(Layout::from_size_align(8, 64).unwrap());
+    assert_eq!(p as usize, base + 72);
+}
+
+#[test_case]
+fn fixed_size_blocks_are_recycled_per_size_class() {
+    use allocator::fixed_size_block::FixedSizeBlockAllocator;
+    use core::alloc::Layout;
+
+    let mut blocks = FixedSizeBlockAllocator::new();
+    unsafe { blocks.init(leaked_arena(8192), 8192) };
+
+    let small = Layout::from_size_align(24, 8).unwrap();
+    let a = blocks.alloc(small);
+    assert_eq!(a as usize % 32, 0, "a 32-byte block is aligned to 32");
+    unsafe { blocks.dealloc(a, small) };
+    assert_eq!(blocks.alloc(Layout::from_size_align(20, 4).unwrap()), a);
+    assert_ne!(blocks.alloc(Layout::from_size_align(8, 8).unwrap()), a);
+
+    let big = Layout::from_size_align(4096, 8).unwrap();
+    let b = blocks.alloc(big);
+    assert!(!b.is_null());
+    unsafe { blocks.dealloc(b, big) };
+    assert_eq!(blocks.alloc(big), b);
 }

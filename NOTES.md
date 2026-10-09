@@ -2132,6 +2132,293 @@ is only used at boot.
 
 ---
 
+## Step 15 — A linked-list allocator: reusing any freed block
+
+**Goal.** Replace the bump allocator with one that can reuse an individual freed block,
+so that one long-lived allocation no longer pins the whole heap. Prove the bump
+allocator's weakness with a test first, then make that test pass.
+
+**Concept.** An allocator needs to remember which parts of the heap are free. The
+obvious place for that record would be a data structure on the heap — but we *are*
+the heap, so there is nowhere to put it. The trick is that free memory is, by
+definition, memory nobody is using: the allocator may write into it. So every free
+region carries its own header in its first bytes:
+
+```rust
+struct ListNode {
+    size: usize,
+    next: Option<&'static mut ListNode>,
+}
+```
+
+16 bytes on x86-64 (`Option<&mut T>` is a single pointer, `None` being the null
+address — the *niche optimisation*). The free regions form a singly linked list
+threaded through the free memory itself; the allocator stores only the head.
+
+- **Allocate** (*first fit*): walk the list, take the first region the request fits
+  in, unlink it, and put back whatever is left over before and after the block.
+- **Free**: write a new `ListNode` at the freed address and push it on the front of
+  the list.
+
+Two consequences follow from the header living inside the block:
+
+1. Every block must be able to hold a `ListNode` once it is freed, so each request is
+   rounded up to at least 16 bytes and to a multiple of 8 (the node's alignment).
+2. A leftover piece smaller than 16 bytes can never go back on the list. The allocator
+   must refuse a placement that would leave one, or those bytes leak forever.
+
+What it does *not* do is merge neighbouring free regions back together (*coalescing*).
+Free A then its neighbour B and the list holds two small regions, not one large one:
+over time the heap fragments into pieces too small for big requests.
+
+**What we did.**
+
+*A correction to the journal first.* Step 14's `Current state` said "Step 14 is
+uncommitted" and listed housekeeping commits `703dce8` and `f565da1`. Neither hash
+exists any more: the history was rewritten, the README/license and `.gitignore` work
+became `a6ea869`, and Step 14 itself was committed as `64697c0`. The `Current state`
+section now lists the real hashes.
+
+*The failing test first.* `tests/heap_allocation.rs`, `long_lived_box_does_not_pin_the_heap`:
+one `Box` kept alive while 2 MiB worth of short-lived boxes are created and dropped.
+Against the bump allocator:
+
+```
+heap_allocation::long_lived_box_does_not_pin_the_heap... [failed]
+panicked at ...\library\alloc\src\alloc.rs:699:9:
+memory allocation of 8 bytes failed
+```
+
+The live-allocation counter never reaches zero, so `next` never rewinds and the 1 MiB
+runs out half-way through. `alloc` returned null; `Box::new` answered with
+`handle_alloc_error`, which in `no_std` panics.
+
+*`src/allocator.rs` split into a module directory.* The root keeps `HEAP_START`,
+`HEAP_SIZE`, `init_heap`, `Locked<A>`, `align_up` and the `#[global_allocator]`
+static. Each design gets a file of its own with its own
+`unsafe impl GlobalAlloc for Locked<…>`: `src/allocator/bump.rs` (moved unchanged),
+`src/allocator/linked_list.rs` (new). Swapping designs is a one-line change to the
+type of `ALLOCATOR`. Child modules can see the parent's private `align_up` — privacy in
+Rust stops at the module boundary going *out*, not going *in*.
+
+*`LinkedListAllocator`*, in `src/allocator/linked_list.rs`:
+
+- `head: ListNode` — a dummy node of size 0 whose `next` is the real list. A dummy
+  head means removing the first real region is no special case.
+- `add_free_region(addr, size)` — asserts alignment and minimum size, writes a node
+  with `ptr.write`, links it in front.
+- `find_region(size, align)` — walks with a `current: &mut ListNode` cursor; on a fit,
+  unlinks `current.next` and returns it as `&'static mut ListNode` plus the start
+  address.
+- `alloc_from_region` — computes the start address and rejects any placement that
+  would leave a gap of 1-15 bytes in front of the block or behind it. When the gap in
+  front would be too small, it moves to the next aligned address instead of giving up.
+- `alloc` — gives *both* gaps back to the list. phil-opp's version returns only the
+  piece behind the block and leaks the alignment padding in front; a page-aligned
+  request could waste up to 4 KiB each time.
+
+*Unit tests* in `src/lib.rs`. Unlike the bump allocator, this one writes into the
+memory it manages, so made-up addresses will not do. `leaked_arena(bytes)` takes a
+`Vec<u64>` from the real kernel heap and leaks it with `Vec::leak`, which returns a
+`&'static mut [u64]`: memory that really does live forever, so the `'static` lists
+pointing into it are not a lie. Four cases: a freed block is handed out again, a
+request that would leave an 8-byte tail is refused, the padding before a 256-aligned
+block is reused, and a block moves past a too-small gap.
+
+**What happened.**
+
+With `ALLOCATOR` switched to `Locked<LinkedListAllocator>`, it compiled first time,
+and the integration test that had failed passed:
+
+```
+heap_allocation::long_lived_box_does_not_pin_the_heap... [ok]
+```
+
+The new unit tests then found a real bug in my own `size_align`:
+
+```
+baddcafe_os::linked_list_keeps_the_alignment_padding... [failed]
+panicked at src\lib.rs:279:5:
+assertion `left == right` failed
+```
+
+The first version followed phil-opp, `layout.align_to(8)?.pad_to_align()`.
+`pad_to_align` rounds the *size* up to a multiple of the *requested alignment*: a
+16-byte request aligned to 256 became a 256-byte request and no longer fit in the
+264-byte test region. In the kernel it would not crash, only waste — a 16-byte,
+page-aligned allocation would eat a whole page. The header only needs the size to be
+a multiple of 8, so the fix rounds to that:
+
+```rust
+let size = align_up(layout.size(), NODE_ALIGN)?.max(NODE_SIZE);
+Some((size, layout.align().max(NODE_ALIGN)))
+```
+
+After it, all cases passed.
+
+A prediction that turned out wrong, recorded because the reason is instructive: I
+also wrote `growing_allocations_do_not_fragment_the_heap`, 2000 `Vec`s of capacity
+1, 2, …, 2000, about 2 MiB in total, expecting a list that never merges to run out
+of memory. It passed. Every size is rounded up to a multiple of 8, so the 2000
+requests are only ~250 distinct sizes; same-size requests reuse the block just freed,
+and the ~250 distinct ones together need about 250 KiB. A test that does not check
+what its name says was deleted.
+
+**Why.** `dealloc` receives the same `Layout` that `alloc` did — that is the
+`GlobalAlloc` contract — so it can recompute the block's size with the same
+`size_align` and does not need to store it anywhere. The size lives in the `ListNode`
+only while the block is free; while it is in use, the user owns every byte.
+
+**Rust concepts touched.**
+
+- **`Option<&'static mut ListNode>`** — a borrow that never ends, pointing at memory
+  that has no owner in the `Box` sense. It is created out of a raw address with
+  `&mut *ptr` inside `unsafe`; the invariant is that the region is mapped, unused and
+  on the list exactly once, so no other `&mut` to it exists.
+- **`Option::take()`** — moves the value out and leaves `None` behind. This is how a
+  `&mut` is unlinked from a list without ever having two live `&mut`s to the same node:
+  ownership of the reference moves, nothing is copied.
+- **The cursor pattern and non-lexical lifetimes** — in `find_region`, `region`
+  borrows `current.next`; the borrow checker accepts `current.next.take()` right after
+  because `region` is not used again (NLL ends a borrow at its last use, not at the end
+  of the block).
+- **Deref coercion on assignment** — `current = current.next.as_mut().unwrap()`
+  assigns a `&mut &'static mut ListNode` to a `&mut ListNode`.
+- **`ptr.write(value)`** versus `*ptr = value` — assignment would first *drop* the old
+  value at that address, which is garbage; `write` does not read or drop anything.
+- **`Vec::leak`** — turning an owned allocation into a `&'static mut` by giving up the
+  ability to free it.
+- **Module privacy** — child modules see the parent's private items.
+
+---
+
+## Step 16 — A fixed-size block allocator, and the end of the list walk
+
+**Goal.** Make the common case — small allocations — constant-time, and make the
+global allocator a fixed-size block allocator with the linked list behind it as
+fallback.
+
+**Concept.** The linked list walks the free list on every allocation, and that list
+grows with fragmentation. Most kernel allocations, however, are small and come in a
+few sizes. A *fixed-size block allocator* rounds every request up to one of a few
+size classes — 8, 16, 32, …, 2048 bytes — and keeps one free list per class. All blocks
+on a list are interchangeable, so:
+
+- **Allocate**: pop the head of the class's list. If the list is empty, carve a new
+  block from the fallback allocator.
+- **Free**: push the block onto its class's list. Every block of a class is big
+  enough, so no search and no splitting.
+
+Each block size is also used as its alignment (a 64-byte block is 64-aligned). A
+request then fits a class if both its size and its alignment are at most the block
+size. Anything above 2048 bytes goes straight to the fallback.
+
+The price: internal waste (a 33-byte request gets a 64-byte block), and blocks never
+return to the fallback. Once memory has been cut into 16-byte blocks, it serves only
+16-byte requests from then on.
+
+**What we did.**
+
+*`src/allocator/fixed_size_block.rs`, new:*
+
+```rust
+const BLOCK_SIZES: &[usize] = &[8, 16, 32, 64, 128, 256, 512, 1024, 2048];
+
+struct FreeBlock {
+    next: Option<&'static mut FreeBlock>,
+}
+
+pub struct FixedSizeBlockAllocator {
+    list_heads: [Option<&'static mut FreeBlock>; BLOCK_SIZES.len()],
+    fallback: LinkedListAllocator,
+}
+```
+
+- `FreeBlock` holds only `next`. The size is implied by which list the block is on.
+- `const _: () = assert!(BLOCK_SIZES[0] >= mem::size_of::<FreeBlock>());` — a
+  compile-time check that the smallest block can hold its own header. If someone ever
+  adds a 4-byte class, the build fails instead of the heap.
+- `list_index(layout)` — the first class `>= max(size, align)`.
+- A new block is carved from the fallback with `Layout::from_size_align(size, size)`,
+  which is what makes every block aligned to its own size.
+
+`ALLOCATOR` became `Locked<FixedSizeBlockAllocator>`; `init_heap` is unchanged, since
+`init` simply hands the range to the fallback.
+
+*Tests.* One library case, `fixed_size_blocks_are_recycled_per_size_class`: a 24-byte
+request gets a 32-aligned block; once it is freed, a 20-byte request (same class) gets
+the *same* block back, an 8-byte request (another class) does not; a 4096-byte request
+goes to the fallback and is reused there too.
+
+**What happened.** It compiled on the first try. `cargo test`, every kernel:
+
+```
+Running 16 tests
+...
+baddcafe_os::fixed_size_blocks_are_recycled_per_size_class... [ok]
+...
+baddcafe_os::linked_list_keeps_the_alignment_padding... [ok]
+baddcafe_os::linked_list_never_leaves_a_gap_too_small_for_a_node... [ok]
+baddcafe_os::linked_list_refuses_what_does_not_fit... [ok]
+baddcafe_os::linked_list_reuses_a_freed_block... [ok]
+...
+Running 8 tests
+heap_allocation::box_lives_on_the_heap... [ok]
+heap_allocation::freed_memory_is_reused... [ok]
+heap_allocation::heap_is_mapped_end_to_end... [ok]
+heap_allocation::large_vec_grows_and_keeps_its_contents... [ok]
+heap_allocation::long_lived_box_does_not_pin_the_heap... [ok]
+heap_allocation::over_aligned_allocation_is_honoured... [ok]
+heap_allocation::second_init_is_refused... [ok]
+heap_allocation::string_formatting_allocates... [ok]
+heap_no_execute::jump_into_heap... [ok]
+page_fault::write_to_unmapped_page... [ok]
+page_fault_protection::write_to_executable_page... [ok]
+stack_overflow::double_fault_survives_stack_overflow... [ok]
+```
+
+28 tests, exit 0, in both `cargo test` and `cargo test --release`. Clippy reports
+nothing in the allocator files.
+
+The production kernel, booted headless on Windows and its screen read through a TCP
+monitor (the recipe is now in the Reference section):
+
+```
+...and we came back from the exception.
+Heap: [1, 4, 9, 16, 25, 36, 49, 64], 0xbaddcafe at 0x444444440040
+```
+
+The same address as under the bump allocator, for a different reason: the `Vec` of
+eight `u64`s (64 bytes) took a 64-byte block carved at the very start of the heap, and
+the `Box<u64>` took an 8-byte block carved right after it.
+
+`over_aligned_allocation_is_honoured` exercises the boundary: a 16-byte value aligned
+to 4096 needs `max(16, 4096) = 4096`, above the largest class, so it goes to the linked
+list — which, after Step 15's fix, uses 16 bytes plus padding instead of 4096.
+
+**Why.** Popping and pushing a list head is a few instructions whatever the heap's
+state, which matters once interrupt-driven code allocates: the time spent with
+interrupts off inside the allocator is now bounded for small requests. The linked list
+still exists for what the classes cannot serve, so the two designs cover each other's
+weakness.
+
+**Rust concepts touched.**
+
+- **`[const { None }; N]`** — an array repeat expression normally needs a `Copy`
+  value, and `Option<&mut T>` is not `Copy` (copying it would create two `&mut`s). An
+  inline `const` block is evaluated once per element instead, which is allowed.
+- **`BLOCK_SIZES.len()` in a type** — array lengths must be known at compile time; the
+  `len()` of a `const` slice is a `const fn`, so it can size `list_heads`.
+- **Compile-time assertions** — `const _: () = assert!(..);` runs the check during
+  compilation; a failure is a build error, not a panic.
+- **`&mut T as *mut T as *mut u8`** — turning a reference back into a raw address to
+  hand out. The `&'static mut FreeBlock` is consumed by the cast, so no reference to
+  the block survives once the user owns it.
+- **`let … else` with an `unsafe` return** — `dealloc` forwards to the fallback's
+  `unsafe fn` inside the diverging branch.
+
+---
+
 ## Reference — files, commands, and how to read the machine
 
 This section is not a journal entry. It is the lookup table: every configuration file
@@ -2298,8 +2585,10 @@ src/pic.rs         the two 8259 PICs
 src/keyboard.rs    scancode set 1 decoding
 src/memory.rs      the page-table walker: translate(), the global frame allocator,
                    create_mapping(), through the bootloader's physical-memory offset
-src/allocator.rs   the heap range, init_heap(), the bump allocator and the
+src/allocator.rs   the heap range, init_heap(), Locked<A>, align_up and the
                    #[global_allocator]
+src/allocator/     bump.rs, linked_list.rs, fixed_size_block.rs: one allocator
+                   design each, each with its own GlobalAlloc impl
 tests/*.rs         integration tests, each a whole kernel of its own
 ```
 
@@ -2429,6 +2718,22 @@ for r in range(25):
 The quotes around the filename are required: unquoted, the monitor tries to parse the
 path as a numeric expression and fails with *"invalid char \'s\' in expression"*.
 
+**On Windows**, piping into `-monitor stdio` does not work (see Step 13). A monitor on a
+TCP socket does: QEMU listens, and PowerShell connects and types the commands.
+
+```powershell
+$q = Start-Process qemu-system-x86_64 -PassThru -ArgumentList `
+  "-drive format=raw,file=`"$img`" -display none -monitor tcp:127.0.0.1:45454,server,nowait"
+Start-Sleep 4
+$c = New-Object Net.Sockets.TcpClient('127.0.0.1', 45454)
+$w = New-Object IO.StreamWriter($c.GetStream()); $w.AutoFlush = $true
+$w.WriteLine('pmemsave 0xb8000 4000 "C:/abs/path/vga.bin"'); Start-Sleep 2
+$w.WriteLine('quit'); $c.Close()
+$d = [IO.File]::ReadAllBytes('C:/abs/path/vga.bin')
+0..24 | % { $r = $_; (-join (0..79 | % { $b = $d[$r*160 + $_*2]
+  if ($b -ge 32 -and $b -lt 127) { [char]$b } else { ' ' } })).TrimEnd() }
+```
+
 To do the same for a **test** run, hand the test executable to `bootimage runner` and
 append the QEMU flags; the tool needs `CARGO_MANIFEST_DIR` when invoked outside cargo:
 
@@ -2546,13 +2851,13 @@ evidence that all three rungs were climbed before control reached `_start`.
 
 - Branch `master`. Committed: `75d458e` (steps 0-3), `d40df33` (step 4), `3fa414d`
   (steps 5-6), `ae7a1a8` (step 7), `da2a262` (step 8), `fd8bae1` (step 9), `d17b0df`
-  (steps 10-11), `905b84f` (step 12), `e75713c` (step 13), then housekeeping
-  (`2693bb2`, `703dce8` README and license, `f565da1` `guides/` back in
-  `.gitignore`). Step 14 is uncommitted as of this entry.
+  (steps 10-11), `905b84f` (step 12), `e75713c` (step 13), housekeeping `2693bb2` and
+  `a6ea869` (README and license), `64697c0` (step 14). Steps 15-16 are uncommitted as
+  of this entry.
 - Toolchain: nightly, pinned by `rust-toolchain.toml`, with `rust-src` and
-  `llvm-tools-preview`. Step 14 was built on the Linux host again, on
-  `1.100.0-nightly` (2026-09-03); Step 13 ran on Windows on `1.101.0-nightly`. The
-  file pins a channel, not a date, so each machine keeps whatever snapshot it has.
+  `llvm-tools-preview`. Steps 15-16 ran on Windows on `1.101.0-nightly` (2026-10-04);
+  Step 14 was built on Linux on `1.100.0-nightly`. The file pins a channel, not a
+  date, so each machine keeps whatever snapshot it has.
 - Edition 2024. `panic = "abort"` on both profiles, `panic-abort-tests = true`.
   `build-std = ["core", "compiler_builtins", "alloc"]`. Unstable features in use:
   `custom_test_frameworks`, `abi_x86_interrupt`.
@@ -2564,12 +2869,12 @@ evidence that all three rungs were climbed before control reached `_start`.
   - `src/lib.rs` — modules, `extern crate alloc`, `init()` (serial → GDT → IDT → PIC →
     `sti`), `hlt_loop()`, `QemuExitCode`, `exit_qemu`, `Testable`, `test_runner`,
     `test_panic_handler`, and a `#[cfg(test)]` `_start` that also sets up the heap.
-    Eleven test cases live here.
+    Sixteen test cases live here, and `leaked_arena()` for the allocator tests.
   - `src/main.rs` — `_start(boot_info)`: `init()` → `memory::init` →
     `allocator::init_heap` → banner (which now prints a `Vec` and a `Box`).
   - `tests/stack_overflow.rs`, `tests/page_fault.rs`, `tests/page_fault_protection.rs`
     — `harness = false`, zero-argument `_start`, unchanged.
-  - `tests/heap_allocation.rs` — seven cases through our own test runner, with a
+  - `tests/heap_allocation.rs` — eight cases through our own test runner, with a
     `BootInfo`-taking `_start` that sets up the heap.
   - `tests/heap_no_execute.rs` — `harness = false`; jumps into the heap and expects an
     instruction-fetch page fault.
@@ -2589,8 +2894,12 @@ evidence that all three rungs were climbed before control reached `_start`.
   `WRITABLE` and `NO_EXECUTE` flags. All reached through the bootloader's
   physical-memory-offset mapping. No `x86_64` crate.
 - `src/allocator.rs`: `HEAP_START = 0x4444_4444_0000`, `HEAP_SIZE = 1 MiB`,
-  `init_heap()`, `BumpAllocator` with checked arithmetic, `Locked<A>`, and the
-  `#[global_allocator]`, locked with interrupts off.
+  `init_heap()`, `Locked<A>`, `align_up`, and the `#[global_allocator]`
+  (`Locked<FixedSizeBlockAllocator>`), locked with interrupts off. Under
+  `src/allocator/`: `bump.rs` (`BumpAllocator`, unchanged from Step 14),
+  `linked_list.rs` (`LinkedListAllocator`, first fit, padding returned to the list, no
+  coalescing) and `fixed_size_block.rs` (`FixedSizeBlockAllocator`, classes 8-2048
+  bytes, the linked list as fallback). Each has its own `GlobalAlloc` impl.
 - `src/pic.rs`: the two 8259s remapped to 32-47, all lines masked except timer,
   keyboard and the cascade, plus `end_of_interrupt` and `io_wait`.
 - `src/keyboard.rs`: scancode set 1 decoded through two 0x40-entry `char` tables, with
@@ -2598,16 +2907,17 @@ evidence that all three rungs were climbed before control reached `_start`.
 - `src/vga_buffer.rs`: the `Writer`, plus backspace, hardware cursor updates through
   ports 0x3D4/0x3D5, and `_print` wrapped in `without_interrupts`. `src/serial.rs`
   likewise.
-- **`cargo run` boots, prints from the heap, and the keyboard types on the screen.
-  `cargo test` runs 22 tests across six kernels and exits 0, in debug and in
-  `--release`.** Verified.
+- **`cargo run` boots and prints from the heap (screen read back through a TCP
+  monitor). `cargo test` runs 28 tests across six kernels and exits 0, in debug and in
+  `--release`.** Verified on Windows.
 - Warnings we are knowingly carrying: cargo's kebab-case binary-name suggestion, the
   future-incompatibility report about nightly's own `core` sources, and older clippy
   lints in `idt.rs`, `keyboard.rs`, `pic.rs` and `port.rs` (missing `Default`,
   function-pointer casts, missing `# Safety` docs) that predate Step 14. Nothing new.
 - Known hazards:
-  - The bump allocator reclaims nothing until *every* allocation is freed. One
-    long-lived `Box` pins the heap, and after that each allocation is permanent.
+  - The linked-list allocator never merges neighbouring free regions, so the heap
+    fragments; and blocks the fixed-size allocator carves from it never return to it.
+    Memory once cut into small blocks serves only small requests from then on.
   - The heap is a fixed 1 MiB and cannot grow.
   - Only vectors 3, 8, 14, 32 and 33 are present. Any other exception still arrives as
     a double fault, which panics with a readable message but tells us nothing about
@@ -2627,19 +2937,16 @@ evidence that all three rungs were climbed before control reached `_start`.
 
 ## Next step
 
-**Allocator designs.**
+**Async/await and cooperative multitasking.**
 
-The bump allocator is correct but cannot reuse a block until the whole heap is free.
-The phil-opp track compares two replacements against it:
+The keyboard handler still prints straight from the interrupt. The next part of the
+track replaces that with a queue: the handler only pushes scancodes, and normal code
+drains the queue. Draining it without busy-waiting is what `async`/`await` is for —
+a `Future` that is *pending* until the handler has pushed something, and a small
+executor that polls futures and halts the CPU (`hlt`) when none can make progress.
 
-- a **linked-list allocator**, which threads a list of free regions *through the
-  free memory itself* (each free block stores its own size and a pointer to the next
-  one), so any freed block can be reused, at the cost of a list walk per allocation
-  and fragmentation over time;
-- a **fixed-size block allocator**, which keeps one free list per size class (8, 16,
-  32, … bytes) and serves most allocations in constant time.
-
-A good first move is a test that the bump allocator *fails*: one long-lived `Box`
-followed by more short-lived allocations than the heap can hold. It should run out
-of memory today and pass once a real free list exists. `Locked<A>` is already generic,
-so swapping the allocator should be a change to one `static`.
+Concepts to meet first, before any code: the `Future` trait and `Poll`, what the
+compiler turns an `async fn` into (a state machine), why that state machine may hold
+references into itself and therefore must not move (`Pin`), and `Waker` — how an
+interrupt handler tells the executor "poll this one again". The heap is what makes
+this affordable: the queue and the boxed futures live there.

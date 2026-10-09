@@ -156,7 +156,7 @@ the blog and the compiler disagree, the compiler wins.
 
 ## 5. Where we are right now
 
-Steps 0-14 are done (see `NOTES.md` for the full story, and its `Current state`
+Steps 0-16 are done (see `NOTES.md` for the full story, and its `Current state`
 section for the authoritative snapshot):
 
 - A freestanding kernel on a custom bare-metal target, booting in QEMU through
@@ -176,9 +176,11 @@ section for the authoritative snapshot):
 - A 1 MiB kernel heap (`src/allocator.rs`), mapped writable and non-executable, behind
   a bump allocator registered as `#[global_allocator]`, so `alloc`'s `Box`, `Vec` and
   `String` work.
+- Three hand-written allocators under `src/allocator/`: bump, linked list (free regions
+  threaded through the free memory), and fixed-size blocks (one free list per size
+  class, the linked list as fallback). The fixed-size block allocator is the global one.
 
-**Next step:** allocator designs — replace the bump allocator with ones that can reuse
-individual freed blocks (linked list, fixed-size blocks).
+**Next step:** async/await and cooperative multitasking.
 
 ## 6. Roadmap
 
@@ -195,7 +197,7 @@ Rough phil-opp order. Tick items off as `NOTES.md` records them.
 - [x] Hardware interrupts — PIC, timer, keyboard
 - [x] Paging and virtual memory
 - [x] Heap allocation
-- [ ] Allocator designs
+- [x] Allocator designs
 - [ ] Async/await and cooperative multitasking
 
 ---

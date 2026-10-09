@@ -92,3 +92,15 @@ fn freed_memory_is_reused() {
         assert_eq!(*x, i);
     }
 }
+
+/// The same churn with one allocation alive throughout: a bump allocator never
+/// rewinds, so this needs an allocator that reuses individual freed blocks.
+#[test_case]
+fn long_lived_box_does_not_pin_the_heap() {
+    let long_lived = Box::new(1u64);
+    for i in 0..(HEAP_SIZE / 8 * 2) {
+        let x = Box::new(i);
+        assert_eq!(*x, i);
+    }
+    assert_eq!(*long_lived, 1);
+}
