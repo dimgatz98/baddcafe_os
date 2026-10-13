@@ -2510,6 +2510,72 @@ Reading for the revisit: [the async chapter](https://os.phil-opp.com/async-await
 
 ---
 
+## Step 18 — Async keyboard input and end-to-end verification
+
+**Goal.** Replace the keyboard interrupt handler's direct printing with a bounded scancode queue and a single async consumer, switch the production entry point to the executor, and verify interrupt wakeups and keyboard input in QEMU.
+
+**Concept.** The keyboard interrupt handler in Step 16 decoded scancodes and printed directly from the interrupt context. This works but is not the right design: interrupt handlers should be short and should not acquire locks that might deadlock if the same interrupt fires recursively. The correct pattern is a queue the handler pushes to and normal code drains.
+
+Now that the heap exists (Step 14) and async/await works (Step 17), we can build a bounded queue with wake-based async. The interrupt handler only pushes bytes and wakes the task; decoding and printing happen in task context, where they can take their time and use the heap safely.
+
+The queue needs to handle overflow gracefully. Scancode decoding relies on state (shift pressed, caps lock on, 0xE0 prefix seen). If the queue overflows and we lose a release or a prefix, the decoder state becomes invalid. The queue therefore reports an overflow error and resets the decoder on the next read.
+
+**What we did.** Created `src/task/keyboard.rs` with a 128-byte ring buffer, a single async consumer (`Scancodes`), and an overflow flag. The interrupt handler in `src/idt.rs` now calls `task::keyboard::add_scancode(scancode)` instead of decoding and printing. The old `KEYBOARD` Mutex global in `src/keyboard.rs` was removed; the decoder is now a local `Keyboard` inside the async task.
+
+The production `_start` in `src/main.rs` was rewritten to:
+- Take the scancode stream with `take_scancodes()` (returns `None` if already claimed, preventing two consumers)
+- Spawn `Task::new(print_keypresses(scancodes))` to decode and print
+- Spawn a second task that logs to serial
+- Run the executor instead of `hlt_loop`
+
+Added `tests/executor_interrupt.rs`, a separate kernel that installs a custom IDT with only a timer handler, spawns a task that waits for timer ticks, and verifies that the task wakes only when the interrupt fires. This proves that interrupt-driven wakeups work.
+
+Added `scripts/check_keyboard.py`, a Python script that boots the production image through QEMU's QMP (QEMU Monitor Protocol), sends keyboard events, reads the VGA buffer to verify output, and checks that the CPU enters idle HLT when no work is ready.
+
+**What happened.** `cargo test` reported:
+
+```text
+Running 42 tests
+...
+executor_interrupt::timer_wakes_a_sleeping_executor... [ok]
+...
+baddcafe_os::task::keyboard::tests::buffered_input_and_ring_wrap_preserve_order... [ok]
+baddcafe_os::task::keyboard::tests::input_after_pending_wakes_the_latest_waiter... [ok]
+baddcafe_os::task::keyboard::tests::overflow_reports_a_gap_then_accepts_new_input... [ok]
+baddcafe_os::task::keyboard::tests::dropping_the_consumer_releases_its_waker_and_claim... [ok]
+baddcafe_os::task::keyboard::tests::cancelling_a_read_keeps_input_for_the_next_read... [ok]
+baddcafe_os::task::keyboard::tests::queue_operations_preserve_disabled_interrupts... [ok]
+baddcafe_os::task::keyboard::tests::a_busy_keyboard_yields_after_each_input_budget... [ok]
+baddcafe_os::task::keyboard::tests::overflow_resets_a_shift_whose_release_was_lost... [ok]
+...
+```
+
+42 tests pass in both debug and release. The production kernel boots, prints "Async executor started" to serial, and accepts keyboard input. The Python check reports:
+
+```text
+keyboard: shift, release, backspace, newline, 24 repeated keys [ok]
+executor: idle HLT and keyboard wakeups with timer masked [ok]
+```
+
+The executor bug fix in `src/task/executor.rs` (changing `borrow().as_ref().unwrap().clone()` to `borrow_mut().take().unwrap()`) was necessary because cloning the waker left the old one in the cell, causing the wake to be lost. `take()` consumes it, which is the correct pattern for a `Waker` that should be replaced on each poll.
+
+**Why.** The queue's `push` and `poll_next` both run inside `idt::without_interrupts` to make the check-and-register-waker operation atomic. An interrupt cannot arrive between checking for input and registering the waiter, so we never miss a wake. The waker is replaced only when the result is `Pending`; if data is available, we return it immediately without registering a new waiter.
+
+The `INPUT_BUDGET` constant (32) limits how many scancodes the keyboard task processes before yielding. This prevents a fast typist from starving other tasks. The task calls `yield_now().await` after each budget, giving peers a turn even if the queue is still non-empty.
+
+The Python script masks the timer interrupt during the check. This proves that the executor really does wake from keyboard interrupts alone, not from periodic timer rescues. The script also verifies that the CPU returns to HLT when idle, confirming that the executor is not busy-polling.
+
+**Rust concepts touched.**
+
+- Ring buffers and wrap-around arithmetic with modulo.
+- `poll_fn` for turning a callback-based API into an async one.
+- `Drop` for releasing resources (the waker and the claim flag) when the consumer is dropped.
+- Critical sections with `without_interrupts`.
+- Integration testing with a custom IDT and a separate kernel.
+- QMP as a programmatic way to control QEMU.
+
+---
+
 ## Reference — files, commands, and how to read the machine
 
 This section is not a journal entry. It is the lookup table: every configuration file
@@ -2567,6 +2633,10 @@ harness = false
 
 [[test]]
 name = "page_fault_protection"
+harness = false
+
+[[test]]
+name = "executor_interrupt"
 harness = false
 
 [dependencies]
@@ -2662,7 +2732,8 @@ target is just a description it reads, not a separate build of the compiler.
 #### Source layout
 
 ```
-src/main.rs        the kernel's `_start`, the banner, the panic handlers
+src/main.rs        the kernel's `_start`, the banner, the panic handlers, and
+                   the async executor startup
 src/lib.rs         module list, init(), hlt_loop, exit_qemu, the test runner and
                    the library's own test kernel and test cases
 src/vga_buffer.rs  the VGA text buffer: Color, ColorCode, ScreenChar, Writer,
@@ -2673,14 +2744,18 @@ src/gdt.rs         GDT, TSS and the double-fault stack
 src/idt.rs         the IDT, the exception and interrupt handlers, TICKS,
                    without_interrupts
 src/pic.rs         the two 8259 PICs
-src/keyboard.rs    scancode set 1 decoding
+src/keyboard.rs    scancode set 1 decoding (no global KEYBOARD Mutex)
 src/memory.rs      the page-table walker: translate(), the global frame allocator,
                    create_mapping(), through the bootloader's physical-memory offset
 src/allocator.rs   the heap range, init_heap(), Locked<A>, align_up and the
                    #[global_allocator]
 src/allocator/     bump.rs, linked_list.rs, fixed_size_block.rs: one allocator
                    design each, each with its own GlobalAlloc impl
+src/task.rs        re-exports executor and keyboard
+src/task/executor.rs wake-driven executor with pinned futures and atomic idle sleep
+src/task/keyboard.rs bounded scancode queue with async consumer and overflow handling
 tests/*.rs         integration tests, each a whole kernel of its own
+scripts/check_keyboard.py  end-to-end keyboard and idle HLT verification through QMP
 ```
 
 #### Toolchain sanity
@@ -2943,17 +3018,17 @@ evidence that all three rungs were climbed before control reached `_start`.
 - Branch `master`. Committed: `75d458e` (steps 0-3), `d40df33` (step 4), `3fa414d`
   (steps 5-6), `ae7a1a8` (step 7), `da2a262` (step 8), `fd8bae1` (step 9), `d17b0df`
   (steps 10-11), `905b84f` (step 12), `e75713c` (step 13), housekeeping `2693bb2` and
-  `a6ea869` (README and license), `64697c0` (step 14), `f48128e` (steps 15-16).
-  Step 17 adds the wake-driven executor; keyboard integration follows next.
+  `a6ea869` (README and license), `64697c0` (step 14), `f48128e` (steps 15-16),
+  `8ccaba4` (steps 17-18).
 - Toolchain: nightly, pinned by `rust-toolchain.toml`, with `rust-src` and
-  `llvm-tools-preview`. Steps 15-16 ran on Windows on `1.101.0-nightly` (2026-10-04);
+  `llvm-tools-preview`. Steps 15-18 ran on Windows on `1.101.0-nightly` (2026-10-04);
   Step 14 was built on Linux on `1.100.0-nightly`. The file pins a channel, not a
   date, so each machine keeps whatever snapshot it has.
 - Edition 2024. `panic = "abort"` on both profiles, `panic-abort-tests = true`.
   `build-std = ["core", "compiler_builtins", "alloc"]`. Unstable features in use:
   `custom_test_frameworks`, `abi_x86_interrupt`.
 - Dependencies: `bootloader = { version = "0.9.35", features = ["map_physical_memory"] }`
-  and `spin = "0.12.3"` (`Mutex` behind `WRITER`/`SERIAL`/`KEYBOARD`, the frame
+  and `spin = "0.12.3"` (`Mutex` behind `WRITER`/`SERIAL`, the frame
   allocator and the heap allocator; `Once` behind the `IDT`, the `GDT`, the `TSS`, each
   test kernel's own IDT, and `memory`'s globals).
 - The crate is a library plus a binary:
@@ -2961,15 +3036,19 @@ evidence that all three rungs were climbed before control reached `_start`.
     `sti`), `hlt_loop()`, `QemuExitCode`, `exit_qemu`, `Testable`, `test_runner`,
     `test_panic_handler`, and a `#[cfg(test)]` `_start` that also sets up the heap.
     Sixteen test cases live here, and `leaked_arena()` for the allocator tests;
-    five more library cases live in `task::executor`.
+    five more library cases live in `task::executor`; nine keyboard queue tests live
+    in `task::keyboard`. The trivial assertion test was replaced with `init_enables_interrupts`.
   - `src/main.rs` — `_start(boot_info)`: `init()` → `memory::init` →
-    `allocator::init_heap` → banner (which now prints a `Vec` and a `Box`).
+    `allocator::init_heap` → banner (which prints a `Vec` and a `Box`), then spawns
+    the async keyboard task and a serial logger and runs the executor.
   - `tests/stack_overflow.rs`, `tests/page_fault.rs`, `tests/page_fault_protection.rs`
     — `harness = false`, zero-argument `_start`, unchanged.
   - `tests/heap_allocation.rs` — eight cases through our own test runner, with a
     `BootInfo`-taking `_start` that sets up the heap.
   - `tests/heap_no_execute.rs` — `harness = false`; jumps into the heap and expects an
     instruction-fetch page fault.
+  - `tests/executor_interrupt.rs` — `harness = false`; installs a custom IDT with only
+    a timer handler, spawns a task that waits for timer ticks, and verifies wakeups.
 - `src/gdt.rs`: `Tss` (`repr(C, packed(4))`), a 20 KiB `UnsafeCell` stack for the
   double-fault handler, an eight-slot `Gdt` with a null descriptor, a ring-0 code
   segment and a 16-byte TSS descriptor, `lgdt`, a `retfq` trampoline to reload `cs`,
@@ -2978,7 +3057,8 @@ evidence that all three rungs were climbed before control reached `_start`.
   (plain, with error code, diverging with error code), `Entry::set_stack_index`,
   handlers for breakpoint (3), double fault (8, on IST 0), page fault (14), timer (32)
   and keyboard (33), the `PageFaultErrorCode` newtype, `read_cr2`, a `TICKS` counter,
-  and `enable`/`disable`/`are_enabled`/`without_interrupts`.
+  and `enable`/`disable`/`are_enabled`/`without_interrupts`. The keyboard handler
+  now calls `task::keyboard::add_scancode` instead of decoding and printing.
 - `src/memory.rs`: the hand-written page-table walker — `Entry`, `Table`
   (`repr(C, align(4096))`), `translate()` (handles 2 MiB/1 GiB huge pages), a single
   global `FrameAllocator` behind `frame_allocator() -> MutexGuard<..>`, and
@@ -2995,19 +3075,29 @@ evidence that all three rungs were climbed before control reached `_start`.
 - `src/pic.rs`: the two 8259s remapped to 32-47, all lines masked except timer,
   keyboard and the cascade, plus `end_of_interrupt` and `io_wait`.
 - `src/keyboard.rs`: scancode set 1 decoded through two 0x40-entry `char` tables, with
-  shift, caps lock and 0xE0-prefixed keys handled; a `Mutex<Keyboard>` global.
+  shift, caps lock and 0xE0-prefixed keys handled. The `KEYBOARD` Mutex global was
+  removed; the decoder is now a local `Keyboard` inside the async task.
 - `src/vga_buffer.rs`: the `Writer`, plus backspace, hardware cursor updates through
   ports 0x3D4/0x3D5, and `_print` wrapped in `without_interrupts`. `src/serial.rs`
   likewise.
-- `src/task.rs` and `src/task/executor.rs`: pinned futures, safe `Wake` implementation,
+- `src/task.rs`: re-exports `executor` and `keyboard`.
+- `src/task/executor.rs`: pinned futures, safe `Wake` implementation,
   a ready flag per task, one poll per ready task per pass, and atomic idle sleep.
-  The production entry point still uses `hlt_loop` until keyboard integration.
-- Step 16 verified boot and 28 tests in debug/release on Windows. Step 17 reran the
-  baseline successfully through Windows Cargo from WSL, then passed the expanded
-  21-case library suite in debug. Production async integration is still pending.
+  The waker bug fix (`borrow_mut().take()` instead of `borrow().as_ref().unwrap().clone()`)
+  prevents lost wakes.
+- `src/task/keyboard.rs`: a 128-byte ring buffer with a single async consumer
+  (`Scancodes`), overflow reporting, and wake-based async. The interrupt handler
+  pushes bytes; the async task decodes and prints with an input budget of 32 scancodes
+  before yielding.
+- `scripts/check_keyboard.py`: a Python script that boots the production image through
+  QEMU's QMP, sends keyboard events, reads the VGA buffer to verify output, and checks
+  that the CPU enters idle HLT when no work is ready.
+- Step 18 verified 42 tests in debug and release on Windows. The production kernel
+  boots with the executor running, accepts keyboard input, and passes the Python
+  end-to-end check.
 - Warnings we are knowingly carrying: cargo's kebab-case binary-name suggestion, the
   future-incompatibility report about nightly's own `core` sources, and older clippy
-  lints in `idt.rs`, `keyboard.rs`, `pic.rs` and `port.rs` (missing `Default`,
+  lints in `idt.rs`, `pic.rs` and `port.rs` (missing `Default`,
   function-pointer casts, missing `# Safety` docs) that predate Step 14. Nothing new.
 - Known hazards:
   - The linked-list allocator never merges neighbouring free regions, so the heap
@@ -3019,22 +3109,22 @@ evidence that all three rungs were climbed before control reached `_start`.
     the original cause.
   - The double-fault stack has no guard page. An overflow inside the handler itself
     would silently corrupt whatever sits below it.
-  - `keyboard_handler` prints directly from the interrupt handler. It cannot deadlock
-    (every `WRITER` user disables interrupts), but the right design is a queue the
-    handler pushes to and normal code drains. That arrives with async/await — and now
-    that a heap exists, the queue can be an allocated one.
   - Extended (0xE0) scancodes — arrows, right control, keypad — are decoded and thrown
     away.
   - `FrameAllocator` re-walks the whole memory map on every `allocate_frame()` call,
     and freed frames are never returned.
   - The frame-allocator lock must not be taken from an interrupt handler; this is
     documented, not enforced.
+  - The keyboard queue is bounded at 128 bytes. A sustained fast typist can overflow it,
+    which resets the decoder state. This is intentional: the alternative is an unbounded
+    queue that could exhaust the heap.
 
 ## Next step
 
-**Async keyboard input and end-to-end verification.**
+**The async implementation is complete.**
 
-The executor exists and its unit tests pass. Replace printing inside the keyboard
-interrupt with a bounded scancode queue and a single async consumer, switch the
-production entry point to the executor, and verify interrupt wakeups and keyboard
-input in QEMU in addition to the full debug/release suite.
+Steps 0-18 cover the full phil-opp async/await track: a wake-driven executor, interrupt-driven
+wakeups, and a bounded async keyboard queue with end-to-end verification. The kernel now has
+cooperative multitasking, a heap, and interrupt-driven I/O. Further OS features (processes,
+filesystems, syscalls, networking) are outside the current scope and would require a new
+roadmap.

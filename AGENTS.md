@@ -183,11 +183,14 @@ section for the authoritative snapshot):
   one ready flag per task, and `sti; hlt` when idle. Scheduling uses one active CPU.
 - A static 128-byte scancode queue with one async consumer. The keyboard interrupt
   only queues input and wakes the task; decoding and printing happen in task context.
-- 42 tests pass in debug and release. A separate Python/QEMU check exercises real
-  keyboard input and idle sleep with the timer masked.
+- The production entry point runs the executor with an async keyboard task and a serial
+  logger, verified by an integration test for timer wakeups and a Python/QEMU end-to-end
+  check for keyboard input and idle HLT.
+- 42 tests pass in debug and release.
 
-**Next step:** revisit Steps 17-18 to learn the completed async implementation.
-The current roadmap is complete; further OS features need a new scope.
+**The async implementation is complete.** The current roadmap (Steps 0-18) covers the
+full phil-opp async/await track. Further OS features (processes, filesystems, syscalls,
+networking) are outside the current scope and would require a new roadmap.
 
 ## 6. Roadmap
 
