@@ -15,6 +15,7 @@ pub mod memory;
 pub mod pic;
 pub mod port;
 pub mod serial;
+pub mod task;
 pub mod vga_buffer;
 
 use core::arch::asm;

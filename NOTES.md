@@ -2419,6 +2419,97 @@ weakness.
 
 ---
 
+## Step 17 — Futures, pinned tasks and a wake-driven executor
+
+**Goal.** Use the heap from Steps 14-16 to hold asynchronous kernel tasks. The human
+explicitly asked for implementation and verification first, with the explanations
+saved here for later study; the usual teaching-first rule remains the default for
+future work.
+
+**Concept.** Calling an `async fn` builds a value representing unfinished work, a
+`Future`. It does not execute the function's body yet. An executor asks that value
+to make progress through `poll`: `Ready(())` means finished, `Pending` means it must
+wait. The compiler turns locals and suspension points into a state machine, so the
+task can return from `poll` without losing its place. `.await` suspends the enclosing
+future only when the awaited future returns `Pending`.
+
+The future can contain a reference to one of its own locals across an await. Moving
+that state machine would invalidate the reference. `Pin<Box<dyn Future<Output = ()>>>`
+solves this: the allocation stays put while the box pointer can move. `dyn Future`
+lets different compiler-generated future types share one collection. `'static` on
+the constructor means a task cannot borrow a temporary from its caller; it does not
+mean the task leaks or lives forever. The executor owns and drops it on completion.
+
+A `Waker` is the task's doorbell, not the task itself. Ringing it marks the task as
+ready; only the executor calls `poll`. We implement the safe `alloc::task::Wake`
+trait with an `Arc` (atomically reference-counted pointer), so cloned wakers keep
+their flag alive without raw pointers or a hand-written `RawWaker` table.
+
+**What we did.** Added `src/task.rs` and `src/task/executor.rs`, exported `task` from
+the library, and added five library tests. `Task::new` pins its future. `spawn`
+allocates a ready flag and caches a waker. `run_ready_tasks` visits each task once
+per pass and polls only those whose ready flag was set. `yield_now().await` rings
+the task's own doorbell and returns `Pending` once, giving peers their turn.
+
+This deliberately differs from the tutorial's bounded ready queue: a flag per task
+coalesces repeated wakes without any queue that can overflow. The tradeoff is an
+O(number of tasks) scan per pass, reasonable for this small single-CPU kernel. The
+executor does not busy-poll pending futures. No dependencies were added.
+
+**What happened.** This session runs in Windows Subsystem for Linux (WSL), while
+the installed Rust toolchain is on Windows. The first attempts exposed the boundary:
+
+```text
+zsh:1: command not found: cargo
+<3>WSL (2 - ) ERROR: UtilBindVsockAnyPort:307: socket failed 1
+```
+
+Using the existing `cargo.exe` with approved WSL-to-Windows execution fixed the
+environment. The baseline `cargo.exe build` and `cargo.exe test` passed all 28
+existing cases. After this step, `cargo.exe build` succeeded and
+`cargo.exe test --lib` reported:
+
+```text
+Running 21 tests
+baddcafe_os::task::executor::tests::a_wake_before_sleep_keeps_the_executor_running... [ok]
+baddcafe_os::task::executor::tests::completed_tasks_drop_and_stale_wakers_cannot_wake_new_tasks... [ok]
+baddcafe_os::task::executor::tests::moving_task_storage_preserves_a_borrow_across_await... [ok]
+baddcafe_os::task::executor::tests::pending_tasks_wait_for_a_wake_and_wakes_coalesce... [ok]
+baddcafe_os::task::executor::tests::self_wakes_survive_poll_and_give_peers_a_turn... [ok]
+```
+
+The pre-existing future-incompatibility warning from nightly's `core` remains.
+Also, the previous snapshot's statement that Steps 15-16 were uncommitted was
+stale: they are committed as `f48128e`.
+
+**Why.** The ready flag is cleared *before* polling with an acquire-release atomic
+exchange. A wake during polling therefore survives for the next pass. A wake uses
+a release store, paired with the executor's acquire operation. On completion the
+entry is removed; old wakers keep only their old flag and cannot wake a new task.
+
+Sleeping has another race: an interrupt could signal work after an idle check but
+before `hlt`, leaving the processor asleep with work ready. The executor disables
+interrupts, checks again, then executes `sti; hlt` in one assembly block. On x86,
+`sti` delays interrupt delivery until after the following instruction. The assembly
+also retains its compiler memory barrier. This assumes one active CPU (Central
+Processing Unit); a remote CPU would need to send a wakeup interrupt too. Tasks must
+return from `poll` and leave interrupts enabled; this is cooperative scheduling,
+not preemptive scheduling that can forcibly take the CPU away from a task.
+
+**Rust concepts touched.**
+
+- `Future`, `Poll`, `Context`, compiler-generated async state machines and `.await`.
+- `Pin`, `Box`, trait objects, ownership and a `'static` bound without a memory leak.
+- `Arc`, `Wake`, `Waker` and acquire/release atomic ordering.
+- `Rc` and interior mutability in tests: tasks themselves do not need to be `Send`.
+
+Reading for the revisit: [the async chapter](https://os.phil-opp.com/async-await/),
+[`Future`](https://doc.rust-lang.org/core/future/trait.Future.html),
+[`Wake`](https://doc.rust-lang.org/alloc/task/trait.Wake.html) and
+[`Waker`](https://doc.rust-lang.org/core/task/struct.Waker.html).
+
+---
+
 ## Reference — files, commands, and how to read the machine
 
 This section is not a journal entry. It is the lookup table: every configuration file
@@ -2852,8 +2943,8 @@ evidence that all three rungs were climbed before control reached `_start`.
 - Branch `master`. Committed: `75d458e` (steps 0-3), `d40df33` (step 4), `3fa414d`
   (steps 5-6), `ae7a1a8` (step 7), `da2a262` (step 8), `fd8bae1` (step 9), `d17b0df`
   (steps 10-11), `905b84f` (step 12), `e75713c` (step 13), housekeeping `2693bb2` and
-  `a6ea869` (README and license), `64697c0` (step 14). Steps 15-16 are uncommitted as
-  of this entry.
+  `a6ea869` (README and license), `64697c0` (step 14), `f48128e` (steps 15-16).
+  Step 17 adds the wake-driven executor; keyboard integration follows next.
 - Toolchain: nightly, pinned by `rust-toolchain.toml`, with `rust-src` and
   `llvm-tools-preview`. Steps 15-16 ran on Windows on `1.101.0-nightly` (2026-10-04);
   Step 14 was built on Linux on `1.100.0-nightly`. The file pins a channel, not a
@@ -2869,7 +2960,8 @@ evidence that all three rungs were climbed before control reached `_start`.
   - `src/lib.rs` — modules, `extern crate alloc`, `init()` (serial → GDT → IDT → PIC →
     `sti`), `hlt_loop()`, `QemuExitCode`, `exit_qemu`, `Testable`, `test_runner`,
     `test_panic_handler`, and a `#[cfg(test)]` `_start` that also sets up the heap.
-    Sixteen test cases live here, and `leaked_arena()` for the allocator tests.
+    Sixteen test cases live here, and `leaked_arena()` for the allocator tests;
+    five more library cases live in `task::executor`.
   - `src/main.rs` — `_start(boot_info)`: `init()` → `memory::init` →
     `allocator::init_heap` → banner (which now prints a `Vec` and a `Box`).
   - `tests/stack_overflow.rs`, `tests/page_fault.rs`, `tests/page_fault_protection.rs`
@@ -2907,9 +2999,12 @@ evidence that all three rungs were climbed before control reached `_start`.
 - `src/vga_buffer.rs`: the `Writer`, plus backspace, hardware cursor updates through
   ports 0x3D4/0x3D5, and `_print` wrapped in `without_interrupts`. `src/serial.rs`
   likewise.
-- **`cargo run` boots and prints from the heap (screen read back through a TCP
-  monitor). `cargo test` runs 28 tests across six kernels and exits 0, in debug and in
-  `--release`.** Verified on Windows.
+- `src/task.rs` and `src/task/executor.rs`: pinned futures, safe `Wake` implementation,
+  a ready flag per task, one poll per ready task per pass, and atomic idle sleep.
+  The production entry point still uses `hlt_loop` until keyboard integration.
+- Step 16 verified boot and 28 tests in debug/release on Windows. Step 17 reran the
+  baseline successfully through Windows Cargo from WSL, then passed the expanded
+  21-case library suite in debug. Production async integration is still pending.
 - Warnings we are knowingly carrying: cargo's kebab-case binary-name suggestion, the
   future-incompatibility report about nightly's own `core` sources, and older clippy
   lints in `idt.rs`, `keyboard.rs`, `pic.rs` and `port.rs` (missing `Default`,
@@ -2937,16 +3032,9 @@ evidence that all three rungs were climbed before control reached `_start`.
 
 ## Next step
 
-**Async/await and cooperative multitasking.**
+**Async keyboard input and end-to-end verification.**
 
-The keyboard handler still prints straight from the interrupt. The next part of the
-track replaces that with a queue: the handler only pushes scancodes, and normal code
-drains the queue. Draining it without busy-waiting is what `async`/`await` is for —
-a `Future` that is *pending* until the handler has pushed something, and a small
-executor that polls futures and halts the CPU (`hlt`) when none can make progress.
-
-Concepts to meet first, before any code: the `Future` trait and `Poll`, what the
-compiler turns an `async fn` into (a state machine), why that state machine may hold
-references into itself and therefore must not move (`Pin`), and `Waker` — how an
-interrupt handler tells the executor "poll this one again". The heap is what makes
-this affordable: the queue and the boxed futures live there.
+The executor exists and its unit tests pass. Replace printing inside the keyboard
+interrupt with a bounded scancode queue and a single async consumer, switch the
+production entry point to the executor, and verify interrupt wakeups and keyboard
+input in QEMU in addition to the full debug/release suite.
