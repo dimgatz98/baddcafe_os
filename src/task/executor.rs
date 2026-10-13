@@ -119,7 +119,7 @@ mod tests {
         }
         assert_eq!(executor.run_ready_tasks(), 1);
         assert_eq!(executor.run_ready_tasks(), 0);
-        saved.borrow().as_ref().unwrap().clone().wake();
+        saved.borrow_mut().take().unwrap().wake();
         assert_eq!(executor.run_ready_tasks(), 1);
     }
 

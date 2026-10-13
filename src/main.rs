@@ -21,12 +21,24 @@ pub extern "C" fn _start(boot_info: &'static BootInfo) -> ! {
     WRITER.lock().clear_screen();
 
     #[cfg(test)]
-    test_main();
+    {
+        test_main();
+        hlt_loop()
+    }
 
     #[cfg(not(test))]
-    banner();
+    {
+        use baddcafe_os::task::{Task, executor::Executor, keyboard};
 
-    hlt_loop()
+        banner();
+        let scancodes = keyboard::take_scancodes().expect("keyboard already has a consumer");
+        let mut executor = Executor::new();
+        executor.spawn(Task::new(keyboard::print_keypresses(scancodes)));
+        executor.spawn(Task::new(async {
+            baddcafe_os::serial_println!("Async executor started");
+        }));
+        executor.run()
+    }
 }
 
 #[cfg(not(test))]
@@ -34,15 +46,20 @@ fn banner() {
     use alloc::boxed::Box;
     use alloc::vec::Vec;
 
-    use baddcafe_os::{idt, println, serial_println};
     use baddcafe_os::vga_buffer::{Color, ColorCode};
+    use baddcafe_os::{idt, println, serial_println};
 
     serial_println!("BaddCafe OS: serial is alive on COM1");
 
     println!("BaddCafe OS");
     println!();
     println!("Booted by bootloader 0.9.35, long mode, paging on.");
-    println!("Screen is memory: {} cells of {} bytes at {:#x}.", 80 * 25, 2, 0xb8000);
+    println!(
+        "Screen is memory: {} cells of {} bytes at {:#x}.",
+        80 * 25,
+        2,
+        0xb8000
+    );
 
     WRITER
         .lock()
@@ -60,7 +77,7 @@ fn banner() {
     println!("Heap: {:?}, {:#x} at {:p}", squares, *boxed, boxed);
 
     println!();
-    println!("Timer and keyboard interrupts are on. Type:");
+    println!("Async keyboard ready. Type:");
 }
 
 #[cfg(not(test))]

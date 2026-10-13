@@ -156,7 +156,7 @@ the blog and the compiler disagree, the compiler wins.
 
 ## 5. Where we are right now
 
-Steps 0-16 are done (see `NOTES.md` for the full story, and its `Current state`
+Steps 0-18 are done (see `NOTES.md` for the full story, and its `Current state`
 section for the authoritative snapshot):
 
 - A freestanding kernel on a custom bare-metal target, booting in QEMU through
@@ -174,13 +174,20 @@ section for the authoritative snapshot):
 - `_start` takes `&'static BootInfo` from the bootloader. Tests that need no
   `BootInfo` still use a zero-argument `_start`.
 - A 1 MiB kernel heap (`src/allocator.rs`), mapped writable and non-executable, behind
-  a bump allocator registered as `#[global_allocator]`, so `alloc`'s `Box`, `Vec` and
+  a fixed-size block allocator registered as `#[global_allocator]`, so `alloc`'s `Box`, `Vec` and
   `String` work.
 - Three hand-written allocators under `src/allocator/`: bump, linked list (free regions
   threaded through the free memory), and fixed-size blocks (one free list per size
   class, the linked list as fallback). The fixed-size block allocator is the global one.
+- Cooperative multitasking under `src/task/`: pinned futures, a safe `Wake` impl,
+  one ready flag per task, and `sti; hlt` when idle. Scheduling uses one active CPU.
+- A static 128-byte scancode queue with one async consumer. The keyboard interrupt
+  only queues input and wakes the task; decoding and printing happen in task context.
+- 42 tests pass in debug and release. A separate Python/QEMU check exercises real
+  keyboard input and idle sleep with the timer masked.
 
-**Next step:** async/await and cooperative multitasking.
+**Next step:** revisit Steps 17-18 to learn the completed async implementation.
+The current roadmap is complete; further OS features need a new scope.
 
 ## 6. Roadmap
 
@@ -198,7 +205,7 @@ Rough phil-opp order. Tick items off as `NOTES.md` records them.
 - [x] Paging and virtual memory
 - [x] Heap allocation
 - [x] Allocator designs
-- [ ] Async/await and cooperative multitasking
+- [x] Async/await and cooperative multitasking
 
 ---
 

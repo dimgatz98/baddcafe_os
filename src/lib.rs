@@ -96,8 +96,8 @@ fn panic(info: &PanicInfo) -> ! {
 }
 
 #[test_case]
-fn trivial_assertion() {
-    assert_eq!(1 + 1, 2);
+fn init_enables_interrupts() {
+    assert!(idt::are_enabled());
 }
 
 #[test_case]

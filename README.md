@@ -16,7 +16,14 @@ page table walker and frame allocator), and a heap, so `Box`, `Vec` and `String`
 work. The heap has three hand-written allocators: bump, linked list, and the one in
 use, a fixed-size block allocator that falls back to the linked list.
 
-Next: async/await and cooperative multitasking.
+Async/await and cooperative multitasking are implemented: a wake-driven executor
+runs pinned tasks, and a bounded keyboard queue moves decoding and printing out of
+the interrupt handler. The CPU halts when no task is ready. This completes the
+current learning roadmap; Steps 17-18 in `NOTES.md` explain the async implementation.
+
+Verified: 42 tests in debug and release, plus production keyboard input and idle
+sleep in QEMU. Scheduling uses one active CPU and requires tasks to yield; there
+are no userspace processes or filesystem yet.
 
 ## Running it
 
@@ -32,19 +39,37 @@ Then:
 ```bash
 cargo run     # build the kernel, make a disk image, boot it in QEMU
 cargo test    # build the test kernels, boot each one, exit with a pass/fail code
+cargo test --release
 ```
+
+On Windows, add `$HOME/scoop/apps/qemu/current` to the shell's `PATH` if QEMU was
+installed through Scoop. From WSL with a Windows-only Rust installation, use
+`cargo.exe` with working Windows interoperability.
+
+An optional end-to-end check needs Python 3 and QEMU on `PATH`:
+
+```bash
+cargo bootimage
+python3 scripts/check_keyboard.py target/x86_64-baddcafe_os/debug/bootimage-baddcafe_os.bin
+```
+
+It sends keyboard events, reads the VGA text buffer and checks idle sleep with the
+timer interrupt masked. On Windows use `python` if that is your Python command.
+For release, build with `cargo bootimage --release` and use the `release` image path.
 
 ## Layout
 
 | Path | What it is |
 |---|---|
-| `src/main.rs` | The kernel entry point and banner |
+| `src/main.rs` | Kernel entry point, banner and async task startup |
 | `src/lib.rs` | Shared init, the test runner and the library's own tests |
 | `src/memory.rs` | Page table walker, frame allocator, mapping creation |
 | `src/allocator.rs`, `src/allocator/` | The kernel heap and its allocators |
 | `src/idt.rs`, `src/gdt.rs`, `src/pic.rs` | Exceptions, segmentation, interrupt controller |
 | `src/vga_buffer.rs`, `src/serial.rs`, `src/keyboard.rs` | Screen, serial port, keyboard |
+| `src/task.rs`, `src/task/` | Pinned tasks, executor and async keyboard input |
 | `tests/` | Integration tests, each a separate kernel |
+| `scripts/check_keyboard.py` | Production keyboard and idle-sleep check through QEMU |
 | `x86_64-baddcafe_os.json` | Our custom bare-metal target specification |
 | `.cargo/config.toml` | Build settings: target, `build-std`, the runner |
 

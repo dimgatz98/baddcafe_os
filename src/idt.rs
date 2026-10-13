@@ -6,7 +6,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use spin::Once;
 
 use crate::gdt::{self, DescriptorTablePointer};
-use crate::{keyboard, pic, print, println, serial_println};
+use crate::{pic, println, serial_println, task};
 
 const BREAKPOINT: u8 = 3;
 const DOUBLE_FAULT: u8 = 8;
@@ -298,8 +298,6 @@ extern "x86-interrupt" fn timer_handler(_stack_frame: InterruptStackFrame) {
 /// so port 0x60 must be drained even when the scancode means nothing to us.
 extern "x86-interrupt" fn keyboard_handler(_stack_frame: InterruptStackFrame) {
     let scancode = unsafe { crate::port::inb(0x60) };
-    if let Some(character) = keyboard::KEYBOARD.lock().decode(scancode) {
-        print!("{}", character);
-    }
+    task::keyboard::add_scancode(scancode);
     unsafe { pic::end_of_interrupt(KEYBOARD) }
 }

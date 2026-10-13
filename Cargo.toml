@@ -29,6 +29,10 @@ harness = false
 name = "heap_no_execute"
 harness = false
 
+[[test]]
+name = "executor_interrupt"
+harness = false
+
 [dependencies]
 bootloader = { version = "0.9.35", features = ["map_physical_memory"] }
 spin = "0.12.3"

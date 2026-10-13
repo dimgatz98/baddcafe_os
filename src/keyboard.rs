@@ -1,5 +1,3 @@
-use spin::Mutex;
-
 const LEFT_SHIFT: usize = 0x2a;
 const RIGHT_SHIFT: usize = 0x36;
 const CAPS_LOCK: usize = 0x3a;
@@ -94,5 +92,3 @@ fn flip_case(character: char) -> char {
         character.to_ascii_uppercase()
     }
 }
-
-pub static KEYBOARD: Mutex<Keyboard> = Mutex::new(Keyboard::new());
